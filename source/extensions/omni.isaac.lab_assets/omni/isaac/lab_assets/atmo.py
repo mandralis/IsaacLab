@@ -15,11 +15,12 @@ from omni.isaac.lab.assets import ArticulationCfg
 # Configuration
 ##
 
-USD_PATH = "/home/m4pc/src/IsaacLab/source/extensions/omni.isaac.lab_assets/data/Robots/Caltech/atmo.usd"
+USD_PATH = "/home/m4pc/src/atmo_urdf/atmo/atmo.usd"
 
 ATMO_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=USD_PATH,
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=10.0,
@@ -34,42 +35,52 @@ ATMO_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 1.5),
+        pos=(0.0, 0.0, 2.0),
         joint_pos={
             ".*": 0.0,
         },
         joint_vel={
-            "armr_to_rotor0": 200.0,
+            "armr_to_rotor0": -200.0,
             "arml_to_rotor1": -200.0,
             "arml_to_rotor2": 200.0,
-            "armr_to_rotor3": -200.0,
+            "armr_to_rotor3": 200.0,
         },
-        # joint_pos={
-        #     "base_to_arml": 0.0,
-        #     "base_to_armr": 0.0
-        # },
     ),
     actuators={
-        "dummy": ImplicitActuatorCfg(
-            joint_names_expr=[".*"],
+        "m0": ImplicitActuatorCfg(
+            joint_names_expr=["armr_to_rotor0"],
             stiffness=0.0,
             damping=0.0,
         ),
-    # actuators={
-    #     "arml_actuator": ImplicitActuatorCfg(
-    #         joint_names_expr=["base_to_arml"],
-    #         effort_limit=100.0,
-    #         velocity_limit=30.0,
-    #         stiffness=1.0,
-    #         damping=10.0,
-    #     ),
-    #     "armr_actuator": ImplicitActuatorCfg(
-    #         joint_names_expr=["base_to_armr"], 
-    #         effort_limit=100.0, 
-    #         velocity_limit=30.0, 
-    #         stiffness=1.0, 
-    #         damping=10.0
-    #     ),
+        "m1": ImplicitActuatorCfg(
+            joint_names_expr=["arml_to_rotor1"],
+            stiffness=0.0,
+            damping=0.0,
+        ),
+        "m2": ImplicitActuatorCfg(
+            joint_names_expr=["arml_to_rotor2"],
+            stiffness=0.0,
+            damping=0.0,
+        ),
+        "m3": ImplicitActuatorCfg(
+            joint_names_expr=["armr_to_rotor3"],
+            stiffness=0.0,
+            damping=0.0,
+        ),                                        
+        "arml_actuator": ImplicitActuatorCfg(
+            joint_names_expr=["base_to_arml"],
+            effort_limit=1e16,
+            velocity_limit=30.0,
+            stiffness=1e15,
+            damping=1e5,
+        ),
+        "armr_actuator": ImplicitActuatorCfg(
+            joint_names_expr=["base_to_armr"], 
+            effort_limit=1e16, 
+            velocity_limit=30, 
+            stiffness=1e15, 
+            damping=1e5,
+        ),
     },
 )
 """Configuration for Caltech's ATMO."""
