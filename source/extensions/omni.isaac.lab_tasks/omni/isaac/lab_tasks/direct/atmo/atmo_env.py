@@ -50,7 +50,7 @@ class ATMOEnvWindow(BaseEnvWindow):
 @configclass
 class ATMOEnvCfg(DirectRLEnvCfg):
     # env
-    episode_length_s = 5.0
+    episode_length_s = 8.0
     decimation = 2
     action_space = 5
     observation_space = 13
@@ -111,15 +111,19 @@ class ATMOEnvCfg(DirectRLEnvCfg):
     tilt_reward_scale             = 0.2
     action_rate_reward_scale      = -0.01
     total_impulse_reward_scale    = 0.0
+    contact_in_acceptance_reward_scale = 0.1
 
     # terminating by hitting ground bonus 
-    terminal_reward_bonus = 0.2
+    # terminal_reward_bonus = 0.2
+
+    # terminate by going too fast penalty
+    too_fast_penalty = -0.2
 
     # get_to_goal_reward_scale = 15.0
     # impact_in_acceptance_bonus = 400.0
     # undesirable_air_time_reward_scale = 5.0
 
-    # contact_in_acceptance_reward_scale = 20.0
+    # 
     # tilt_in_acceptance_reward_scale = 20.0
     # flat_orientation_in_acceptance_reward_scale = 20.0
     # lin_vel_in_acceptance_reward_scale = 20.0
@@ -177,7 +181,11 @@ class ATMOEnv(DirectRLEnv):
                 "tilt",
                 "action_rate_l2",
                 "total_impulse",
-                "terminal_reward",
+                "contact_in_acceptance",
+                "too_fast_penalty"
+
+                # "terminal_reward",
+
 
                 # "get_to_goal",
                 # "impact_in_acceptance_bonus",
@@ -185,7 +193,7 @@ class ATMOEnv(DirectRLEnv):
 
                 # "impact_vel_penalty",
 
-                # "contact_in_acceptance",
+                # 
                 # "tilt_in_acceptance",
                 # "flat_orientation_in_acceptance",
                 # "lin_vel_in_acceptance",
@@ -297,8 +305,9 @@ class ATMOEnv(DirectRLEnv):
 
         # determine if terminal state has been reached
         died, _ = self._get_dones()
+        too_fast_penalty = died * self.cfg.too_fast_penalty
 
-        terminal_reward = died * self.cfg.terminal_reward_bonus
+        # terminal_reward = died * self.cfg.terminal_reward_bonus
 
         # desired velocity
         lin_vel_des = torch.zeros(3, device=self.device)
@@ -358,14 +367,17 @@ class ATMOEnv(DirectRLEnv):
             "tilt":                       height_mapped * tilt_error_mapped * self.cfg.tilt_reward_scale * self.step_dt,
             "action_rate_l2":             action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
             "total_impulse":              total_impulse_mapped * self.cfg.total_impulse_reward_scale * self.step_dt,
-            "terminal_reward":            terminal_reward,
+            "contact_in_acceptance":      current_contacts * in_acceptance_ball * self.cfg.contact_in_acceptance_reward_scale * self.step_dt,
+            "too_fast_penalty":           too_fast_penalty
+
+            # "terminal_reward":            terminal_reward,
 
             # "get_to_goal":                in_acceptance_ball * self.cfg.get_to_goal_reward_scale * self.step_dt,
             # "impact_in_acceptance_bonus": in_acceptance_ball * new_contacts * self.cfg.impact_in_acceptance_bonus * self.step_dt,
             # "undesirable_air_time":       undesirable_air_time_mapped * self.cfg.undesirable_air_time_reward_scale * self.step_dt,
 
             
-            # "contact_in_acceptance": current_contacts * in_acceptance_ball * self.cfg.contact_in_acceptance_reward_scale * self.step_dt,
+            # 
             # "tilt_in_acceptance": tilt_error_mapped * in_acceptance_ball * self.cfg.tilt_in_acceptance_reward_scale * self.step_dt,
             # "flat_orientation_in_acceptance": - flat_orientation * in_acceptance_ball * self.cfg.flat_orientation_in_acceptance_reward_scale * self.step_dt,
             # "lin_vel_in_acceptance": lin_vel_mapped * in_acceptance_ball * self.cfg.lin_vel_in_acceptance_reward_scale * self.step_dt,
@@ -383,7 +395,8 @@ class ATMOEnv(DirectRLEnv):
     
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        died = self._contact_sensor.compute_first_contact(self.step_dt)[:, :].any(dim=1)
+        # died = self._contact_sensor.compute_first_contact(self.step_dt)[:, :].any(dim=1)
+        died = torch.linalg.norm(self._robot.data.root_com_lin_vel_w, dim=1) > 0.7
         return died,time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
