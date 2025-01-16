@@ -26,7 +26,7 @@ params:
           val: 0
         fixed_sigma: True
     mlp:
-      units: [64, 64]
+      units: [128, 128, 128]
       activation: elu
       d2rl: False
 
@@ -45,26 +45,26 @@ params:
     device_name: 'cuda:0'
     multi_gpu: False
     ppo: True
-    mixed_precision: False
-    normalize_input: True
+    mixed_precision: True
+    normalize_input: False
     normalize_value: True
     value_bootstrap: True
     num_actors: -1  # configured from the script (based on num_envs)
     reward_shaper:
-      scale_value: 0.01
+      scale_value: 0.6
     normalize_advantage: True
     gamma: 0.99
     tau: 0.95
-    learning_rate: 5e-4
+    learning_rate: 1e-3
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.016
+    kl_threshold: 0.01
     score_to_win: 200000000
     max_epochs: 2000
     save_best_after: 100
     save_frequency: 25
     grad_norm: 1.0
-    entropy_coef: 0.0
+    entropy_coef: 0.005
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 24
@@ -73,4 +73,4 @@ params:
     critic_coef: 2
     clip_value: True
     seq_length: 4
-    bounds_loss_coef: 0.0001
+    bounds_loss_coef: 0.0

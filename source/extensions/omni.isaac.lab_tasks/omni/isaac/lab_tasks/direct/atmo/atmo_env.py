@@ -53,7 +53,7 @@ class ATMOEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     decimation = 2
     action_space = 5
-    observation_space = 17
+    observation_space = 13
     state_space = 0
     debug_vis = True
 
@@ -103,13 +103,25 @@ class ATMOEnvCfg(DirectRLEnvCfg):
     # reward scales
     lin_vel_reward_scale = 3.0
     ang_vel_reward_scale = 0.7
-    ori_reward_scale     = 12.0 
-    distance_to_goal_reward_scale = 15.0
-    tilt_reward_scale    = 15.0
-    impact_vel_reward_scale = 100.0
+    ori_reward_scale     = 12.0
+    distance_to_goal_reward_scale = 7.0
+    tilt_reward_scale    = 20.0
+    air_time_reward_scale = 5.0
+    get_to_goal_reward_scale = 15.0
+    contact_in_acceptance_reward_scale = 20.0
+    tilt_in_acceptance_reward_scale = 20.0
+    flat_orientation_in_acceptance_reward_scale = 20.0
+    lin_vel_in_acceptance_reward_scale = 20.0
+    ang_vel_in_acceptance_reward_scale = 20.0
+    impact_in_acceptance_bonus = 400.0
+    impact_vel_penalty = 100.0
+
     impact_reward_scale  = 1.0
-    ground_penalty_reward_scale = 3.0
     ground_thrust_reward_scale = 3.0
+    impact_vel_reward_scale = 10.0
+
+    # acceptance state
+    delta_d = 0.2
 
 
 class ATMOEnv(DirectRLEnv):
@@ -151,8 +163,19 @@ class ATMOEnv(DirectRLEnv):
                 "orientation",
                 "distance_to_goal",
                 "tilt",
-                "impact",
-                "ground_thrust",
+
+                # "impact",
+                "undesirable_air_time",
+                "get_to_goal",
+
+                "contact_in_acceptance",
+                "tilt_in_acceptance",
+                "flat_orientation_in_acceptance",
+                "lin_vel_in_acceptance",
+                "ang_vel_in_acceptance",
+                "impact_in_acceptance_bonus",
+                "impact_vel_penalty",
+                # "ground_thrust",
             ]
         }
 
@@ -166,6 +189,10 @@ class ATMOEnv(DirectRLEnv):
         # Get the joint indices
         self._joint0 = self._robot.find_joints("base_to_arml")[0]
         self._joint1 = self._robot.find_joints("base_to_armr")[0]
+
+        # Get arml and armr indices
+        self._arml = self._robot.find_bodies("arml")[0]
+        self._armr = self._robot.find_bodies("armr")[0]
 
         # Get inertial parameters
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
@@ -229,7 +256,7 @@ class ATMOEnv(DirectRLEnv):
         self._robot.set_joint_position_target(self._joint_pos[:, 0], joint_ids=self._joint0)
         self._robot.set_joint_position_target(self._joint_pos[:, 0], joint_ids=self._joint1)
 
-    def _get_observations(self) -> dict:
+    def _get_observations_cts(self) -> dict:
         # Get position and orientation of ATMO relative to desired position 
         relative_pos_w, _ = subtract_frame_transforms(
             self._robot.data.root_link_state_w[:, :3], self._robot.data.root_link_state_w[:, 3:7], self._desired_pos_w
@@ -250,8 +277,29 @@ class ATMOEnv(DirectRLEnv):
         )
         observations = {"policy": obs}
         return observations
+    
+    def _get_observations(self) -> dict:
+        # Get position and orientation of ATMO relative to desired position 
+        relative_pos_w, _ = subtract_frame_transforms(
+            self._robot.data.root_link_state_w[:, :3], self._robot.data.root_link_state_w[:, 3:7], self._desired_pos_w
+        )
 
-    def _get_rewards(self) -> torch.Tensor:
+        # Get current tilt angle
+        tilt_angle = self._robot.data.joint_pos[:, self._joint0[0]].unsqueeze(dim=1)
+        obs = torch.cat(
+            [
+                relative_pos_w,
+                self._robot.data.root_com_lin_vel_w,
+                self._robot.data.root_com_ang_vel_b,
+                self._robot.data.projected_gravity_b,
+                tilt_angle,     # current tilt angle
+            ],
+            dim=-1,
+        )
+        observations = {"policy": obs}
+        return observations
+
+    def _get_rewards_cts(self) -> torch.Tensor:
         
         # find which environments are currently in contact
         current_contact_time = self.scene["contact_sensor"].data.current_contact_time
@@ -264,11 +312,6 @@ class ATMOEnv(DirectRLEnv):
 
         # update the first contact
         self._first_contact[new_contact_idx] = new_contacts[new_contact_idx]
-
-        # # print statements to debug contact 
-        # print("Current Contacts: ", current_contacts)
-        # print("First Contacts: ", self._first_contact)
-        # print("New Contacts: ", new_contacts)
 
         # get distance to goal
         distance_to_goal = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_link_pos_w, dim=1)
@@ -328,6 +371,87 @@ class ATMOEnv(DirectRLEnv):
             self._episode_sums[key] += value
         return reward
 
+    def _get_rewards(self) -> torch.Tensor:
+
+        # for contacts we primarily care about the bodies arml and armr
+        # if those bodies are in contact, we consider it a desirable contact
+
+        # find which environments are currently in contact
+        current_contact_time = self.scene["contact_sensor"].data.current_contact_time[:, [self._arml[0], self._armr[0]]]
+        num_contact = torch.sum(current_contact_time > 0.0, dim=1)
+        current_contacts  = num_contact > 0
+
+        # new contacts
+        new_contacts = torch.logical_and(torch.logical_xor(current_contacts, self._first_contact),current_contacts)
+        new_contact_idx = torch.nonzero(new_contacts)
+
+        # update the first contact
+        self._first_contact[new_contact_idx] = new_contacts[new_contact_idx]
+
+        # get distance to goal
+        distance_to_goal = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_link_pos_w, dim=1)
+        distance_to_goal_mapped = 1 - torch.tanh(distance_to_goal / 0.8)
+
+        # get height
+        height = self._robot.data.root_link_pos_w[:, 2]
+        height_mapped = torch.exp(-torch.square(height) / 0.25)
+
+        # get linear and angular velocity
+        lin_vel     = torch.sum(torch.square(self._robot.data.root_com_lin_vel_w), dim=1)
+        ang_vel     = torch.sum(torch.square(self._robot.data.root_com_ang_vel_b), dim=1)
+
+        # get tilt error
+        tilt = self._robot.data.joint_pos[:, self._joint0[0]]
+        tilt_error = torch.square(tilt - pi/2)
+        tilt_error_mapped = torch.exp(-tilt_error / 0.25)
+
+        # get orientation
+        # eulerXYZ   = euler_xyz_from_quat(self._robot.data.root_link_quat_w)
+        flat_orientation = torch.abs(1 -  self.quat_axis(self._robot.data.root_link_quat_w, 2)[..., 2])
+        # flat_orientation = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1)
+
+        # get air time after first contact
+        undesirable_air_time = self._first_contact * ~current_contacts * self.step_dt
+        undesirable_air_time_mapped = torch.exp(-undesirable_air_time / 0.25)
+
+        # get landing acceptance state
+        in_acceptance_ball = (distance_to_goal - self.cfg.delta_d) < 0.0
+
+        # # impact bonus reward 
+        # impact = (  
+        #             - self.cfg.impact_vel_reward_scale * (lin_vel + ang_vel)
+        #             + self.cfg.tilt_reward_scale * tilt_error_mapped 
+        #             - self.cfg.ori_reward_scale * flat_orientation 
+        #             + self.cfg.distance_to_goal_reward_scale * distance_to_goal_mapped 
+        #     ) * new_contacts
+
+        rewards = {
+            "lin_vel": -lin_vel * self.cfg.lin_vel_reward_scale * self.step_dt,
+            "ang_vel": -ang_vel * self.cfg.ang_vel_reward_scale * self.step_dt,
+            "orientation": -flat_orientation * self.cfg.ori_reward_scale * self.step_dt,
+            "distance_to_goal": distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
+            "tilt": height_mapped * tilt_error_mapped * self.cfg.tilt_reward_scale * self.step_dt,
+            # "impact": impact * self.cfg.impact_reward_scale,
+            
+            "undesirable_air_time": undesirable_air_time_mapped * self.cfg.air_time_reward_scale * self.step_dt,
+            "get_to_goal": in_acceptance_ball * self.cfg.get_to_goal_reward_scale * self.step_dt,
+            
+            "contact_in_acceptance": current_contacts * in_acceptance_ball * self.cfg.contact_in_acceptance_reward_scale * self.step_dt,
+            "tilt_in_acceptance": tilt_error_mapped * in_acceptance_ball * self.cfg.tilt_in_acceptance_reward_scale * self.step_dt,
+            "flat_orientation_in_acceptance": - flat_orientation * in_acceptance_ball * self.cfg.flat_orientation_in_acceptance_reward_scale * self.step_dt,
+            "lin_vel_in_acceptance": - lin_vel * in_acceptance_ball * self.cfg.lin_vel_in_acceptance_reward_scale * self.step_dt,
+            "ang_vel_in_acceptance": - ang_vel * in_acceptance_ball * self.cfg.ang_vel_in_acceptance_reward_scale * self.step_dt,
+            
+            "impact_in_acceptance_bonus": in_acceptance_ball * new_contacts * self.cfg.impact_in_acceptance_bonus,
+            "impact_vel_penalty": - (lin_vel + ang_vel) * new_contacts * self.cfg.impact_vel_penalty * self.step_dt,
+        }
+        reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+        
+        # Logging
+        for key, value in rewards.items():
+            self._episode_sums[key] += value
+        return reward
+    
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         eulerXYZ   = euler_xyz_from_quat(self._robot.data.root_link_quat_w)
