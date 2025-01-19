@@ -111,6 +111,13 @@ def main():
         ppo_runner.alg.actor_critic, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
     )
 
+    # import onnx policy
+    # policy_loaded = torch.jit.load("/home/m4pc/src/IsaacLab/logs/rsl_rl/atmo/2025-01-16_17-22-04/exported/policy.pt",
+                                #    map_location=env.unwrapped.device)
+
+    policy_loaded = torch.jit.load("/home/m4pc/src/IsaacLab/logs/rsl_rl/atmo/2025-01-18_15-42-02/exported/policy.pt",
+                                   map_location=env.unwrapped.device)
+
     # reset environment
     obs, _ = env.get_observations()
     timestep = 0
@@ -120,6 +127,11 @@ def main():
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
+            # compare to loaded policy
+            actions_loaded = policy_loaded(obs)
+            # print compare both actions in separate statements
+            print(f"Actions processed: {(1 + actions.clone().clamp(-1.0, 1.0))/2}")
+            print(f"Actions Loaded processed: {(1 + actions_loaded.clone().clamp(-1.0, 1.0))/2}")
             # env stepping
             obs, _, _, _ = env.step(actions)
         if args_cli.video:

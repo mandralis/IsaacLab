@@ -50,12 +50,12 @@ class ATMOEnvWindow(BaseEnvWindow):
 @configclass
 class ATMOEnvCfg(DirectRLEnvCfg):
     # env
-    episode_length_s = 8.0
-    decimation = 2
-    action_space = 5
-    observation_space = 13
-    state_space = 0
-    debug_vis = True
+    episode_length_s  = 8.0
+    decimation        = 2
+    action_space      = 5
+    observation_space = 14
+    state_space       = 0
+    debug_vis         = True
 
     ui_window_class_type = ATMOEnvWindow
 
@@ -91,49 +91,55 @@ class ATMOEnvCfg(DirectRLEnvCfg):
 
     # robot
     robot: ArticulationCfg = ATMO_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    kT = 28.15
-    kM = 0.018
-    max_tilt_vel = pi/8
+    kT_0 = 28.15
+    kM_0 = 0.018
+    max_tilt_vel_0 = pi/8
+
+    # random forces and torques
+    disturbance_force_scale  = 4 * kT_0 * 0.02
+    disturbance_moment_scale = 4 * kT_0 * kM_0 * 0.002
+
+    # random parameters
+    kT_error_scale = 0.2
+    kM_error_scale = 0.2
+    max_tilt_vel_error_scale = 0.2
+
+    # thruster dynamics low pass filter constant
+    alpha = 1.0
 
     # contact sensor
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
         prim_path="/World/envs/env_.*/Robot/.*", track_air_time=True, history_length=2
     )
 
-    # acceptance state
-    delta_d                       = 0.2
+    # acceptance state radius
+    delta_d                            = 0.2
     
     # reward scales
-    lin_vel_reward_scale          = 0.3
-    ang_vel_reward_scale          = 0.08
-    ori_reward_scale              = 0.12
-    distance_to_goal_reward_scale = 0.18
-    tilt_reward_scale             = 0.2
-    action_rate_reward_scale      = -0.01
-    total_impulse_reward_scale    = 0.0
-    contact_in_acceptance_reward_scale = 0.1
-
-    # terminating by hitting ground bonus 
-    # terminal_reward_bonus = 0.2
-
-    # terminate by going too fast penalty
-    too_fast_penalty = -0.2
+    lin_vel_reward_scale               = 0.12
+    ang_vel_reward_scale               = 0.10
+    ori_reward_scale                   = 0.12
+    distance_to_goal_reward_scale      = 0.25
+    tilt_reward_scale                  = 0.4
+    action_rate_reward_scale           = 0.07
+    contact_in_acceptance_reward_scale = 0.15
+    ground_thrust_reward_scale         = 0.13
+    too_fast_penalty                   = -0.2
 
     # get_to_goal_reward_scale = 15.0
     # impact_in_acceptance_bonus = 400.0
     # undesirable_air_time_reward_scale = 5.0
-
-    # 
     # tilt_in_acceptance_reward_scale = 20.0
     # flat_orientation_in_acceptance_reward_scale = 20.0
     # lin_vel_in_acceptance_reward_scale = 20.0
     # ang_vel_in_acceptance_reward_scale = 20.0
     # impact_vel_penalty = 100.0
-
     # impact_reward_scale  = 1.0
-    # ground_thrust_reward_scale = 3.0
+    # 
     # impact_vel_reward_scale = 10.0
-
+    # terminating by hitting ground bonus 
+    # terminal_reward_bonus = 0.2
+    # total_impulse_reward_scale    = 0.0
 
 
 class ATMOEnv(DirectRLEnv):
@@ -147,6 +153,7 @@ class ATMOEnv(DirectRLEnv):
         self._previous_actions = torch.zeros(
             self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device
         )
+        self._actions_filtered = torch.zeros_like(self._actions)
 
         self._thrust0 = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment0 = torch.zeros(self.num_envs, 1, 3, device=self.device)
@@ -170,6 +177,10 @@ class ATMOEnv(DirectRLEnv):
         # First contact flag (all environments start with False)
         self._first_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # disturbance force and moment
+        self._disturbance_force_direction = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self._disturbance_moment_direction = torch.zeros(self.num_envs, 1, 3, device=self.device)
+
         # Logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -180,9 +191,9 @@ class ATMOEnv(DirectRLEnv):
                 "distance_to_goal",
                 "tilt",
                 "action_rate_l2",
-                "total_impulse",
                 "contact_in_acceptance",
-                "too_fast_penalty"
+                "too_fast_penalty",
+                "ground_thrust",
 
                 # "terminal_reward",
 
@@ -192,6 +203,7 @@ class ATMOEnv(DirectRLEnv):
                 # "undesirable_air_time",
 
                 # "impact_vel_penalty",
+                # "total_impulse",
 
                 # 
                 # "tilt_in_acceptance",
@@ -222,6 +234,11 @@ class ATMOEnv(DirectRLEnv):
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
 
+        # Initialize kT, kM and max_tilt_vel_0
+        self.kT           = self.cfg.kT_0 * torch.ones(self.num_envs, 1, device=self.device)
+        self.kM           = self.cfg.kM_0 * torch.ones(self.num_envs, 1, device=self.device)
+        self.max_tilt_vel = self.cfg.max_tilt_vel_0 * torch.ones(self.num_envs, 1, device=self.device)
+
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
 
@@ -245,24 +262,28 @@ class ATMOEnv(DirectRLEnv):
         # Clamp actions to [-1, 1]
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
+        # Pass thruster actions through a low pass filter
+        self._actions_filtered[:, :4] = self.low_pass_filter(self._actions.clone()[:,:4], self._actions_filtered[:,:4], self.cfg.alpha)
+        self._actions_filtered[:, 4]  = self._actions[:, 4].clone()
+
         # Assign the thrust to each of the rotors
-        self._thrust0[:, 0, 2] = self.cfg.kT * (self._actions[:, 0] + 1.0) / 2.0
-        self._thrust1[:, 0, 2] = self.cfg.kT * (self._actions[:, 1] + 1.0) / 2.0
-        self._thrust2[:, 0, 2] = self.cfg.kT * (self._actions[:, 2] + 1.0) / 2.0
-        self._thrust3[:, 0, 2] = self.cfg.kT * (self._actions[:, 3] + 1.0) / 2.0
+        self._thrust0[:, 0, 2] = self.kT[:,0] * (self._actions_filtered[:, 0] + 1.0) / 2.0
+        self._thrust1[:, 0, 2] = self.kT[:,0] * (self._actions_filtered[:, 1] + 1.0) / 2.0
+        self._thrust2[:, 0, 2] = self.kT[:,0] * (self._actions_filtered[:, 2] + 1.0) / 2.0
+        self._thrust3[:, 0, 2] = self.kT[:,0] * (self._actions_filtered[:, 3] + 1.0) / 2.0
 
         # Assign the moments to each of the rotors
-        self._moment0[:, 0, 2] = -self.cfg.kM * self._thrust0[:, 0, 2]
-        self._moment1[:, 0, 2] = -self.cfg.kM * self._thrust1[:, 0, 2]
-        self._moment2[:, 0, 2] =  self.cfg.kM * self._thrust2[:, 0, 2]
-        self._moment3[:, 0, 2] =  self.cfg.kM * self._thrust3[:, 0, 2]
+        self._moment0[:, 0, 2] = -self.kM[:,0]  * self._thrust0[:, 0, 2]
+        self._moment1[:, 0, 2] = -self.kM[:,0]  * self._thrust1[:, 0, 2]
+        self._moment2[:, 0, 2] =  self.kM[:,0]  * self._thrust2[:, 0, 2]
+        self._moment3[:, 0, 2] =  self.kM[:,0]  * self._thrust3[:, 0, 2]
 
         # Assign the joint positions and velocities
-        tilt_action = (self._actions[:, 4] + 1.0) / 2.0
-        self._joint_pos[:, 0, 0] = self._joint_pos[:, 0, 0] + self.cfg.max_tilt_vel * tilt_action * self.step_dt
+        tilt_action = (self._actions_filtered[:, 4] + 1.0) / 2.0
+        self._joint_pos[:, 0, 0] = self._joint_pos[:, 0, 0] + self.max_tilt_vel[:,0] * tilt_action * self.step_dt
         self._joint_pos = torch.clamp(self._joint_pos,0.0,torch.pi/2)
 
-        self._joint_vel[:, 0, 0] = self.cfg.max_tilt_vel * tilt_action
+        self._joint_vel[:, 0, 0] = self.max_tilt_vel[:,0] * tilt_action
 
     def _apply_action(self):
         # Apply the thrust and moments to the rotor bodies
@@ -279,21 +300,30 @@ class ATMOEnv(DirectRLEnv):
         self._robot.set_joint_position_target(self._joint_pos[:, 0], joint_ids=self._joint0)
         self._robot.set_joint_position_target(self._joint_pos[:, 0], joint_ids=self._joint1)
 
+        # Sample random normal disturbances
+        force_intensity = torch.normal(torch.tensor(0.0), self.cfg.disturbance_force_scale)
+        moment_intensity = torch.normal(torch.tensor(0.0), self.cfg.disturbance_moment_scale)
+        disturbance_force  = force_intensity * self._disturbance_force_direction
+        disturbance_moment = moment_intensity * self._disturbance_moment_direction
+        self._robot.set_external_force_and_torque(disturbance_force, disturbance_moment, body_ids=self._base_link)
+
     def _get_observations(self) -> dict:
         self._previous_actions = self._actions.clone()
         # Get position and orientation of ATMO relative to desired position 
-        relative_pos_w, _ = subtract_frame_transforms(
-            self._robot.data.root_link_state_w[:, :3], self._robot.data.root_link_state_w[:, 3:7], self._desired_pos_w
-        )
+        # relative_pos_w, _ = subtract_frame_transforms(
+        #     self._robot.data.root_link_state_w[:, :3], self._robot.data.root_link_state_w[:, 3:7], self._desired_pos_w
+        # )
+        relative_pos_w = self._desired_pos_w - self._robot.data.root_link_pos_w
 
         # Get current tilt angle
         tilt_angle = self._robot.data.joint_pos[:, self._joint0[0]].unsqueeze(dim=1)
         obs = torch.cat(
             [
                 relative_pos_w,
+                self._robot.data.root_link_quat_w,
                 self._robot.data.root_com_lin_vel_w,
                 self._robot.data.root_com_ang_vel_b,
-                self._robot.data.projected_gravity_b,
+                # self._robot.data.projected_gravity_b,
                 tilt_angle,     # current tilt angle
             ],
             dim=-1,
@@ -305,8 +335,6 @@ class ATMOEnv(DirectRLEnv):
 
         # determine if terminal state has been reached
         died, _ = self._get_dones()
-        too_fast_penalty = died * self.cfg.too_fast_penalty
-
         # terminal_reward = died * self.cfg.terminal_reward_bonus
 
         # desired velocity
@@ -357,7 +385,11 @@ class ATMOEnv(DirectRLEnv):
         in_acceptance_ball = (distance_to_goal - self.cfg.delta_d) < 0.0
 
         # action rate
-        action_rate = torch.sum(torch.square(self._actions - self._previous_actions), dim=1)
+        action_rate_mapped = torch.exp(-torch.sum(torch.square(self._actions - self._previous_actions), dim=1)/0.25)
+
+        # reward low thruster actions that occur after first contact
+        ground_thrust = torch.sum(torch.square(self._actions[:,:4]), dim=1) * self._first_contact
+        ground_thrust_mapped = torch.exp(-ground_thrust / 0.25)
 
         rewards = {
             "lin_vel":                    lin_vel_mapped * self.cfg.lin_vel_reward_scale * self.step_dt,
@@ -365,26 +397,21 @@ class ATMOEnv(DirectRLEnv):
             "orientation":                flat_orientation_mapped * self.cfg.ori_reward_scale * self.step_dt,
             "distance_to_goal":           distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
             "tilt":                       height_mapped * tilt_error_mapped * self.cfg.tilt_reward_scale * self.step_dt,
-            "action_rate_l2":             action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
-            "total_impulse":              total_impulse_mapped * self.cfg.total_impulse_reward_scale * self.step_dt,
+            "action_rate_l2":             action_rate_mapped * self.cfg.action_rate_reward_scale * self.step_dt,
             "contact_in_acceptance":      current_contacts * in_acceptance_ball * self.cfg.contact_in_acceptance_reward_scale * self.step_dt,
-            "too_fast_penalty":           too_fast_penalty
+            "too_fast_penalty":           died * self.cfg.too_fast_penalty,
+            "ground_thrust":              ground_thrust_mapped * self.cfg.ground_thrust_reward_scale * self.step_dt
 
             # "terminal_reward":            terminal_reward,
-
             # "get_to_goal":                in_acceptance_ball * self.cfg.get_to_goal_reward_scale * self.step_dt,
             # "impact_in_acceptance_bonus": in_acceptance_ball * new_contacts * self.cfg.impact_in_acceptance_bonus * self.step_dt,
             # "undesirable_air_time":       undesirable_air_time_mapped * self.cfg.undesirable_air_time_reward_scale * self.step_dt,
-
-            
-            # 
             # "tilt_in_acceptance": tilt_error_mapped * in_acceptance_ball * self.cfg.tilt_in_acceptance_reward_scale * self.step_dt,
             # "flat_orientation_in_acceptance": - flat_orientation * in_acceptance_ball * self.cfg.flat_orientation_in_acceptance_reward_scale * self.step_dt,
             # "lin_vel_in_acceptance": lin_vel_mapped * in_acceptance_ball * self.cfg.lin_vel_in_acceptance_reward_scale * self.step_dt,
             # "ang_vel_in_acceptance": ang_vel_mapped * in_acceptance_ball * self.cfg.ang_vel_in_acceptance_reward_scale * self.step_dt,
-            
-            # 
             # "impact_vel_penalty": (lin_vel_mapped + ang_vel_mapped) * new_contacts * self.cfg.impact_vel_penalty * self.step_dt,
+            # "total_impulse":              total_impulse_mapped * self.cfg.total_impulse_reward_scale * self.step_dt,
         }
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         
@@ -396,8 +423,12 @@ class ATMOEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         # died = self._contact_sensor.compute_first_contact(self.step_dt)[:, :].any(dim=1)
-        died = torch.linalg.norm(self._robot.data.root_com_lin_vel_w, dim=1) > 0.7
-        return died,time_out
+        died1 = torch.linalg.norm(self._robot.data.root_com_lin_vel_w, dim=1) > 0.7
+        _,_,yaw = euler_xyz_from_quat(self._robot.data.root_link_quat_w)
+        died2 =  torch.abs(yaw - self._initial_yaw.squeeze()) > 0.8
+        died3 = torch.linalg.norm(self._robot.data.root_link_pos_w[:, :2] - self._desired_pos_w[:, :2], dim=1) > 0.4
+        died = died1 | died2 | died3
+        return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
@@ -430,12 +461,11 @@ class ATMOEnv(DirectRLEnv):
         self._previous_actions[env_ids] = 0.0
 
         # Sample new desired positions
-        self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-0.5, 0.5)
+        # self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-0.5, 0.5)
+        self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2])
         self._desired_pos_w[env_ids, :2] += self._terrain.env_origins[env_ids, :2]
         self._desired_pos_w[env_ids, 2] =  torch.zeros_like(self._desired_pos_w[env_ids, 2])
         
-        # Reset robot state with randomization
-
         # Get the default root state of the robot
         default_root_state = self._robot.data.default_root_state[env_ids]
 
@@ -451,7 +481,7 @@ class ATMOEnv(DirectRLEnv):
         # Randomize the initial angular velocity
         default_root_state[:, 10:13] = torch.zeros_like(default_root_state[:, 10:13]).uniform_(-0.1, 0.1)
 
-        # Randomize the initial orientation by sampling a random quaternion that makes physical sense
+        # Randomize the initial orientation by sampling a random quaternion
         default_root_state[:, 3:7], self._initial_yaw[env_ids,0] = self.random_quaternion(len(env_ids))
 
         # Randomize the initial tilt angle 
@@ -474,6 +504,18 @@ class ATMOEnv(DirectRLEnv):
         # Reset the first contact array 
         self._first_contact[env_ids] = False
 
+        # Sample disturbance directions for the episode
+        self._disturbance_force_direction  = torch.normal(0.0, 1.0, size=(self.num_envs,1,3),device=self.device)
+        self._disturbance_force_direction = self._disturbance_force_direction / (torch.linalg.norm(self._disturbance_force_direction, dim=1).unsqueeze(dim=1) + 1e-6)
+        
+        self._disturbance_moment_direction  = torch.normal(0.0, 1.0, size=(self.num_envs,1,3),device=self.device)
+        self._disturbance_moment_direction = self._disturbance_moment_direction / (torch.linalg.norm(self._disturbance_moment_direction, dim=1).unsqueeze(dim=1) + 1e-6)
+
+        # Randomize kT, kM and max_tilt_vel
+        self.kT[env_ids]           = self.cfg.kT_0 * ( 1 + self.cfg.kT_error_scale * torch.zeros_like(self.kT[env_ids]).uniform_(-1., 1.))
+        self.kM[env_ids]           = self.cfg.kM_0 * ( 1 + self.cfg.kM_error_scale * torch.zeros_like(self.kM[env_ids]).uniform_(-1., 1.))
+        self.max_tilt_vel[env_ids] = self.cfg.max_tilt_vel_0 * ( 1 + self.cfg.max_tilt_vel_error_scale * torch.zeros_like(self.max_tilt_vel[env_ids]).uniform_(-1., 1.))
+
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first time
         if debug_vis:
@@ -492,6 +534,10 @@ class ATMOEnv(DirectRLEnv):
     def _debug_vis_callback(self, event):
         # update the markers
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
+
+    def low_pass_filter(self, x, y, alpha):
+        # x input, and y output
+        return alpha * x + (1 - alpha) * y
 
     def random_quaternion(self, num):
         """Returns sampled rotation around z-axis.

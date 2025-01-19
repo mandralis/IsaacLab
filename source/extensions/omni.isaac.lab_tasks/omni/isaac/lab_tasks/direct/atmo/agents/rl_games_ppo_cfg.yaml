@@ -60,7 +60,7 @@ params:
     schedule_type: legacy
     kl_threshold: 0.01
     score_to_win: 200000000
-    max_epochs: 2000
+    max_epochs: 6000
     save_best_after: 100
     save_frequency: 25
     grad_norm: 1.0
