@@ -15,7 +15,7 @@ from omni.isaac.lab_tasks.utils.wrappers.rsl_rl import (
 @configclass
 class ATMOPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 4000
+    max_iterations = 200000
     save_interval = 50
     experiment_name = "atmo"
     empirical_normalization = False
