@@ -16,7 +16,7 @@ params:
     separate: False
     space:
       continuous:
-        mu_activation: None
+        mu_activation: tanh
         sigma_activation: None
 
         mu_init:
@@ -34,6 +34,12 @@ params:
         name: default
       regularizer:
         name: None
+    
+    # rnn:
+    #   name: lstm
+    #   units: 128
+    #   layers: 1
+    #   before_mlp: True
 
   load_checkpoint: False # flag which sets whether to load the checkpoint
   load_path: '' # path to the checkpoint to load
@@ -60,9 +66,9 @@ params:
     schedule_type: legacy
     kl_threshold: 0.01
     score_to_win: 200000000
-    max_epochs: 6000
+    max_epochs: 20000
     save_best_after: 100
-    save_frequency: 25
+    save_frequency: 50
     grad_norm: 1.0
     entropy_coef: 0.005
     truncate_grads: True
