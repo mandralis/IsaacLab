@@ -49,6 +49,7 @@ import torch
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.player import BasePlayer
 from rl_games.torch_runner import Runner
+import rl_games.algos_torch.flatten as flatten
 
 from omni.isaac.lab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from omni.isaac.lab.utils.assets import retrieve_file_path
@@ -57,6 +58,30 @@ from omni.isaac.lab.utils.dict import print_dict
 import omni.isaac.lab_tasks  # noqa: F401
 from omni.isaac.lab_tasks.utils import get_checkpoint_path, load_cfg_from_registry, parse_env_cfg
 from omni.isaac.lab_tasks.utils.wrappers.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
+
+import onnx
+
+
+class ModelWrapper(torch.nn.Module):
+    '''
+    Main idea is to ignore outputs which we don't need from model
+    '''
+    def __init__(self, model):
+        torch.nn.Module.__init__(self)
+        self._model = model
+        
+        
+    def forward(self,input_dict):
+        input_dict['obs'] = self._model.norm_obs(input_dict['obs'])
+        '''
+        just model export doesn't work. Looks like onnx issue with torch distributions
+        thats why we are exporting only neural network
+        '''
+        #print(input_dict)
+        #output_dict = self._model.a2c_network(input_dict)
+        #input_dict['is_train'] = False
+        #return output_dict['logits'], output_dict['values']
+        return self._model.a2c_network(input_dict)
 
 
 def main():
@@ -128,6 +153,8 @@ def main():
 
     # set number of actors into agent config
     agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
+    print("num_actors: ", agent_cfg["params"]["config"]["num_actors"])
+
     # create runner from rl-games
     runner = Runner()
     runner.load(agent_cfg)
@@ -136,6 +163,24 @@ def main():
     agent.restore(resume_path)
     agent.reset()
 
+    # export policy to onnx
+    inputs = {
+        'obs' : torch.zeros((1,) + agent.obs_shape).to(agent.device),
+        'rnn_states' : agent.states,
+    }
+
+    with torch.no_grad():
+        adapter = flatten.TracingAdapter(ModelWrapper(agent.model), inputs, allow_non_tensor=True)
+        traced = torch.jit.trace(adapter, adapter.flattened_inputs, check_trace=False)
+        flattened_outputs = traced(*adapter.flattened_inputs)
+        print(flattened_outputs)
+        
+    filename = "policy.onnx"
+    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    if not os.path.exists(export_model_dir):
+        os.makedirs(export_model_dir, exist_ok=True)
+    torch.onnx.export(traced, *adapter.flattened_inputs, os.path.join(export_model_dir, filename), verbose=True, input_names=['obs'], output_names=['mu','log_std', 'value'])
+
     # reset environment
     obs = env.reset()
     if isinstance(obs, dict):
@@ -143,9 +188,11 @@ def main():
     timestep = 0
     # required: enables the flag for batched observations
     _ = agent.get_batch_size(obs, 1)
+
     # initialize RNN states if used
     if agent.is_rnn:
         agent.init_rnn()
+
     # simulate environment
     # note: We simplified the logic in rl-games player.py (:func:`BasePlayer.run()`) function in an
     #   attempt to have complete control over environment stepping. However, this removes other
@@ -166,6 +213,7 @@ def main():
                 if agent.is_rnn and agent.states is not None:
                     for s in agent.states:
                         s[:, dones, :] = 0.0
+
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

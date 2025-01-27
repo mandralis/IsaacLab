@@ -16,7 +16,7 @@ params:
     separate: False
     space:
       continuous:
-        mu_activation: tanh
+        mu_activation: sigmoid
         sigma_activation: None
 
         mu_init:
