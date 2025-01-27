@@ -17,6 +17,7 @@ import argparse
 import torch
 import numpy as np 
 import onnxruntime as ort
+from IPython import embed
 
 """Launch Isaac Sim Simulator first."""
 from omni.isaac.lab.app import AppLauncher
@@ -61,9 +62,10 @@ def main():
 
     sim_dt                   = 1 / 200
     decimation               = 2
-    sim_time                 = 8.0
+    sim_time                 = 5.0
+    sim_steps                = int(sim_time/sim_dt)
 
-    pos_d                    = torch.tensor([0.5, -0.5, 0.0], device=args_cli.device)
+    pos_d                    = torch.tensor([0.0, 0.0, 0.0], device=args_cli.device)
 
     max_tilt_vel             = torch.pi / 8
     kT                       = 28.15
@@ -74,7 +76,6 @@ def main():
     disturbance_moment_scale = 4 * kT * kM * 0.25    
     
     # Load kit helper
-    sim_steps = int(sim_time/sim_dt)
     sim_cfg = sim_utils.SimulationCfg(dt=sim_dt, device=args_cli.device)
     sim = SimulationContext(sim_cfg)
     
@@ -129,8 +130,14 @@ def main():
     sim_dt = sim.get_physics_dt()
     sim_time = 0.0
     count = 0
+
+    # Log actions and observations and time and plot them when simulation is done
+    actions_log      = []
+    observations_log = []
+    times_log        = []
+
     # Simulate physics
-    while simulation_app.is_running():
+    while simulation_app.is_running() and count < sim_steps:
         # reset
         if count % sim_steps == 0:
             # reset counters
@@ -145,13 +152,18 @@ def main():
             # reset command
             print(">>>>>>>> Reset!")
 
+        obs = get_observations(robot, pos_d, actions).cpu().detach().numpy()
         if count % decimation == 0:
             # get action from rl 
-            obs = get_observations(robot, pos_d, actions).cpu().detach().numpy()
             outputs = rl.run(None, {"obs": obs.astype(np.float32)})
             mu = outputs[0]
             # sigma = np.exp(outputs[1])
             actions = torch.tensor(mu, device=args_cli.device)   
+
+        # log observations actions and times
+        actions_log.append(actions.cpu().detach().numpy())
+        observations_log.append(obs)
+        times_log.append(sim_time)
 
         # Apply low-pass filter
         filtered_actions[:, :4] = low_pass_filter(actions[:, :4], filtered_actions[:, :4], alpha)
@@ -178,7 +190,7 @@ def main():
         # Apply disturbance
         disturbance_force        = torch.zeros(robot.num_instances, 3, device=args_cli.device).uniform_(-disturbance_force_scale, disturbance_force_scale)
         disturbance_moment       = torch.zeros(robot.num_instances, 3, device=args_cli.device).uniform_(-disturbance_moment_scale, disturbance_moment_scale)
-        robot.set_external_force_and_torque(disturbance_force, disturbance_moment, body_ids=base_link)
+        # robot.set_external_force_and_torque(disturbance_force, disturbance_moment, body_ids=base_link)
 
         # Apply the thrust and moments to the rotor bodies
         robot.set_external_force_and_torque(thrust[:, 0, :], moment[:, 0, :], body_ids=rotor0)
@@ -207,8 +219,54 @@ def main():
         # update buffers
         robot.update(sim_dt)
 
+    return times_log, observations_log, actions_log
+    
+def plot_data():
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    # Plot the data
+    fig, axs = plt.subplots(3, 1, figsize=(12, 12))
+    fig.suptitle("ATMO Simulation")
+
+    # Plot the actions
+    actions = np.array(actions_log).squeeze()
+    axs[0].plot(times_log, actions[:, 0], label="Thrust 0")
+    axs[0].plot(times_log, actions[:, 1], label="Thrust 1")
+    axs[0].plot(times_log, actions[:, 2], label="Thrust 2")
+    axs[0].plot(times_log, actions[:, 3], label="Thrust 3")
+    axs[0].plot(times_log, actions[:, 4], label="Tilt")
+    axs[0].set_title("Actions")
+    axs[0].set_xlabel("Time")
+    axs[0].set_ylabel("Value")
+    axs[0].legend()
+
+    # Plot the observations
+    observations = np.array(observations_log).squeeze()
+    axs[1].plot(times_log, observations[:, 0], label="rel X")
+    axs[1].plot(times_log, observations[:, 1], label="rel Y")
+    axs[1].plot(times_log, observations[:, 2], label="rel Z")
+    axs[1].set_title("Observations")
+    axs[1].set_xlabel("Time")
+    axs[1].set_ylabel("Value")
+    axs[1].legend()
+
+    axs[2].plot(times_log, observations[:, 7], label="VX")
+    axs[2].plot(times_log, observations[:, 8], label="VY")
+    axs[2].plot(times_log, observations[:, 9], label="VZ")
+    axs[2].set_title("Observations")
+    axs[2].set_xlabel("Time")
+    axs[2].set_ylabel("Value")
+    axs[2].legend()
+
+    plt.show()
+
 if __name__ == "__main__":
     # run the main function
-    main()
+    times_log, observations_log, actions_log = main()
+
+    # plot the data
+    plot_data()
+
     # close sim app
     simulation_app.close()
