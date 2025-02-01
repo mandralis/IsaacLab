@@ -58,10 +58,14 @@ def get_observations(robot, desired_pos_w, actions):
 """Main function."""
 def main():
     # Parameters
-    rl                       = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-01-25_16-43-12/nn/exported/policy.onnx")
+    # rl                       = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-01-25_16-43-12-best-ad-rand-noise-5sec_ep/nn/exported/policy.onnx")
+    # rl                       = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-01-26_23-27-46-ad-rand-noise-5sec-ep-acc-reward-high/nn/exported/policy.onnx")
+    # rl                       = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-01-27_10-09-50/nn/exported/policy.onnx")
+    # rl                       = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-01-29_20-16-29/nn/exported/policy.onnx")
+    rl                       = ort.InferenceSession("//home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-01-31_16-40-31/nn/exported/policy.onnx")
 
-    sim_dt                   = 1 / 200
-    decimation               = 2
+    sim_dt                   = 1 / 100
+    decimation               = 1
     sim_time                 = 5.0
     sim_steps                = int(sim_time/sim_dt)
 
@@ -70,10 +74,13 @@ def main():
     max_tilt_vel             = torch.pi / 8
     kT                       = 28.15
     kM                       = 0.018
-    T_m                      = 0.015
+    T_m                      = 0.05
     alpha                    = 1.0 - np.exp(-sim_dt / T_m).item()
     disturbance_force_scale  = 4 * kT * 0.25
     disturbance_moment_scale = 4 * kT * kM * 0.25    
+
+    disturb                  = False
+    quantize_tilt_actions    = False
     
     # Load kit helper
     sim_cfg = sim_utils.SimulationCfg(dt=sim_dt, device=args_cli.device)
@@ -170,7 +177,11 @@ def main():
         filtered_actions[:, 4]  = actions[:, 4]
 
         # Assign the joint positions and velocities
-        tilt_action     = filtered_actions[:, 4]
+        if quantize_tilt_actions:
+            tilt_action = torch.round(filtered_actions[:, 4])
+        else:
+            tilt_action     = filtered_actions[:, 4]
+
         joint_pos[:, 0] = joint_pos[:, 0] + max_tilt_vel * tilt_action * sim_dt
         joint_pos       = torch.clamp(joint_pos,0.0,torch.pi/2)
         joint_vel[:, 0] = max_tilt_vel * tilt_action
@@ -190,7 +201,8 @@ def main():
         # Apply disturbance
         disturbance_force        = torch.zeros(robot.num_instances, 3, device=args_cli.device).uniform_(-disturbance_force_scale, disturbance_force_scale)
         disturbance_moment       = torch.zeros(robot.num_instances, 3, device=args_cli.device).uniform_(-disturbance_moment_scale, disturbance_moment_scale)
-        # robot.set_external_force_and_torque(disturbance_force, disturbance_moment, body_ids=base_link)
+        if disturb:
+            robot.set_external_force_and_torque(disturbance_force, disturbance_moment, body_ids=base_link)
 
         # Apply the thrust and moments to the rotor bodies
         robot.set_external_force_and_torque(thrust[:, 0, :], moment[:, 0, :], body_ids=rotor0)
@@ -259,6 +271,14 @@ def plot_data():
     axs[2].set_ylabel("Value")
     axs[2].legend()
 
+    # also plot tilt angle
+    tilt_angle = np.rad2deg(observations[:, 13])
+    fig, ax = plt.subplots()
+    ax.plot(times_log, tilt_angle)
+    ax.set_title("Tilt Angle")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Tilt Angle")
+
     plt.show()
 
 if __name__ == "__main__":
@@ -267,6 +287,11 @@ if __name__ == "__main__":
 
     # plot the data
     plot_data()
+
+    # save data
+    np.save("times_log.npy", times_log)
+    np.save("observations_log.npy", observations_log)
+    np.save("actions_log.npy", actions_log)
 
     # close sim app
     simulation_app.close()
