@@ -11,6 +11,8 @@ import omni.isaac.lab.sim as sim_utils
 from omni.isaac.lab.actuators import ImplicitActuatorCfg
 from omni.isaac.lab.assets import ArticulationCfg
 
+
+
 ##
 # Configuration
 ##
@@ -39,34 +41,9 @@ ATMO_CFG = ArticulationCfg(
         joint_pos={
             ".*": 0.0,
         },
-        joint_vel={
-            "armr_to_rotor0": -200.0,
-            "arml_to_rotor1": -200.0,
-            "arml_to_rotor2": 200.0,
-            "armr_to_rotor3": 200.0,
-        },
     ),
     actuators={
-        "m0": ImplicitActuatorCfg(
-            joint_names_expr=["armr_to_rotor0"],
-            stiffness=0.0,
-            damping=0.0,
-        ),
-        "m1": ImplicitActuatorCfg(
-            joint_names_expr=["arml_to_rotor1"],
-            stiffness=0.0,
-            damping=0.0,
-        ),
-        "m2": ImplicitActuatorCfg(
-            joint_names_expr=["arml_to_rotor2"],
-            stiffness=0.0,
-            damping=0.0,
-        ),
-        "m3": ImplicitActuatorCfg(
-            joint_names_expr=["armr_to_rotor3"],
-            stiffness=0.0,
-            damping=0.0,
-        ),                                        
+                
         "arml_actuator": ImplicitActuatorCfg(
             joint_names_expr=["base_to_arml"],
             effort_limit=1e16,

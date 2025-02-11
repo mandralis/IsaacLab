@@ -38,7 +38,7 @@ params:
     # rnn:
     #   name: lstm
     #   units: 128
-    #   layers: 1
+    #   layers: 3
     #   before_mlp: True
 
   load_checkpoint: False # flag which sets whether to load the checkpoint
@@ -57,11 +57,11 @@ params:
     value_bootstrap: True
     num_actors: -1  # configured from the script (based on num_envs)
     reward_shaper:
-      scale_value: 0.6
+      scale_value: 1.0
     normalize_advantage: True
     gamma: 0.99
     tau: 0.95
-    learning_rate: 1e-3
+    learning_rate: 1e-5
     lr_schedule: adaptive
     schedule_type: legacy
     kl_threshold: 0.01
