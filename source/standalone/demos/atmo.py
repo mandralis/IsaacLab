@@ -179,9 +179,9 @@ def get_observations(robot, desired_pos_w, action_history):
 def main():
     # Parameters
     # rl                      = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-02-05_21-38-02-best-rot-mat-moments/nn/exported/policy.onnx")
-    rl                      = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-02-10_19-44-18/nn/exported/policy.onnx")
+    rl                      = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-02-12_13-26-05/nn/exported/policy.onnx")
 
-    sim_dt                   = 1 / 100  
+    sim_dt                   = 1 / 50  
     decimation               = 1
     sim_time                 = 6.0
     sim_steps                = int(sim_time/sim_dt)
@@ -198,12 +198,12 @@ def main():
     max_tilt_vel             = torch.pi / 8
     kT                       = 28.15
     kM                       = 0.018
-    T_m                      = 0.1
+    T_m                      = 0.25
     alpha                    = 1.0 - np.exp(-sim_dt / T_m).item()
     disturbance_force_scale  = 4 * kT * 0.2
     disturbance_moment_scale = 4 * kT * kM * 0.2
 
-    disturb                  = False 
+    disturb                  = True 
     quantize_tilt_actions    = False
     
     # Load kit helper
@@ -256,7 +256,7 @@ def main():
     joint_vel = robot.data.default_joint_vel
 
     # initialize actions
-    actions = 1.0 * torch.ones(robot.num_instances, 5, device=args_cli.device)
+    actions = torch.ones(robot.num_instances, 5, device=args_cli.device)
     filtered_actions = torch.zeros(robot.num_instances, 5, device=args_cli.device)
 
     # action history
