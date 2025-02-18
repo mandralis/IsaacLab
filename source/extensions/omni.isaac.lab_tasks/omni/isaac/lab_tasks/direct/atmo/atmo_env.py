@@ -126,7 +126,7 @@ class ATMOEnvCfg(DirectRLEnvCfg):
 
     # observation delay (num steps)
     observation_buffer_length          = 5
-    observation_delay                  = 1
+    observation_delay                  = 0
 
     # acceptance state radius
     delta_d                            = 0.40

@@ -1,3 +1,7 @@
+**/*.npy
+**/acados_models/*
+source/standalone/demos/data/
+
 # C++
 **/cmake-build*/
 **/build*/

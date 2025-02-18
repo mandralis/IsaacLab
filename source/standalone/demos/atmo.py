@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-This script demonstrates how to simulate atmo with a learned policy.
+This script demonstrates how to simulate atmo with a learned policy and MPC.
 
 .. code-block:: bash
 
@@ -12,12 +12,19 @@ This script demonstrates how to simulate atmo with a learned policy.
     ./isaaclab.sh -p source/standalone/demos/atmo.py
 
 """
-
+import os
 import argparse
 import torch
 import numpy as np 
-import onnxruntime as ort
 from IPython import embed
+import datetime
+import scipy
+import onnxruntime as ort
+
+"""Import MPC acados implementation"""
+from acados_template          import AcadosOcpSolver
+from atmo_mpc                 import create_ocp_solver_description
+from atmo_parameters          import params_, get_cost_weights
 
 """Launch Isaac Sim Simulator first."""
 from omni.isaac.lab.app import AppLauncher
@@ -87,7 +94,7 @@ def define_markers() -> VisualizationMarkers:
     )
     return VisualizationMarkers(marker_cfg)
  
-def plot_data(actions_log, filtered_actions_log, observations_log, times_log):
+def plot_data(actions_log, filtered_actions_log, observations_log, times_log, x_ref_log):
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
 
@@ -119,7 +126,6 @@ def plot_data(actions_log, filtered_actions_log, observations_log, times_log):
     axs[1].set_ylabel("Value")
     axs[1].legend()
 
-
     # Plot the observations
     observations = np.array(observations_log).squeeze()
     axs[2].plot(times_log, observations[:, 0], label="rel X")
@@ -129,6 +135,13 @@ def plot_data(actions_log, filtered_actions_log, observations_log, times_log):
     axs[2].set_xlabel("Time")
     axs[2].set_ylabel("Value")
     axs[2].legend()
+
+    # plot the reference positions on axs[2]
+    x_ref = np.array(x_ref_log).squeeze()
+    axs[2].plot(times_log, x_ref[:, 0], label="X Ref", linestyle="--")
+    axs[2].plot(times_log, x_ref[:, 1], label="Y Ref", linestyle="--")
+    axs[2].plot(times_log, x_ref[:, 2], label="Z Ref", linestyle="--")
+
 
     axs[3].plot(times_log, observations[:, 12], label="VX")
     axs[3].plot(times_log, observations[:, 13], label="VY")
@@ -175,37 +188,139 @@ def get_observations(robot, desired_pos_w, action_history):
     )
     return obs
 
-"""Main function."""
-def main():
-    # Parameters
-    # rl                      = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-02-05_21-38-02-best-rot-mat-moments/nn/exported/policy.onnx")
-    rl                      = ort.InferenceSession("/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-02-12_13-26-05/nn/exported/policy.onnx")
+def get_mpc_state(robot):
+    # tilt angle
+    joint0 = robot.find_joints("base_to_arml")[0]
+    tilt_angle = robot.data.joint_pos[:, joint0[0]]
 
-    sim_dt                   = 1 / 50  
-    decimation               = 1
-    sim_time                 = 6.0
-    sim_steps                = int(sim_time/sim_dt)
+    # position
+    pos = robot.data.root_link_pos_w
+    pos_transformed = torch.tensor([pos[:,0], -pos[:,1], -pos[:,2]], device=args_cli.device)
 
+    # orientation
+    quat = robot.data.root_link_quat_w
+    quat_transformed = torch.tensor([quat[:,0], quat[:,1], -quat[:,2], -quat[:,3]],device=args_cli.device)
+    roll, pitch, yaw = euler_xyz_from_quat(quat_transformed.unsqueeze(dim=0))
 
-    # create initial pose i..e initial position and quaternion
-    initial_pose              = torch.tensor([0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0], device=args_cli.device)
-    initial_pose[3:]          = quat_from_euler_xyz(torch.tensor(0.0),torch.tensor(0.0),torch.tensor(0.0))
+    # wrap angles between -pi and pi 
+    roll = torch.fmod(roll + np.pi, 2 * np.pi) - np.pi
+    pitch = torch.fmod(pitch + np.pi, 2 * np.pi) - np.pi
+    yaw = torch.fmod(yaw + np.pi, 2 * np.pi) - np.pi
 
+    # linear velocity
+    lin_vel = robot.data.root_com_lin_vel_w
+    lin_vel_transformed = torch.tensor([lin_vel[:,0], -lin_vel[:,1], -lin_vel[:,2]], device=args_cli.device)
 
-    pos_d                    = torch.tensor([0.0, 0.0, 0.0], device=args_cli.device)
-    initial_yaw              = torch.tensor([0.0], device=args_cli.device)
+    # angular velocity
+    ang_vel = robot.data.root_com_ang_vel_b
+    ang_vel_transformed = torch.tensor([ang_vel[:,0], -ang_vel[:,1], -ang_vel[:,2]], device=args_cli.device)
 
-    max_tilt_vel             = torch.pi / 8
-    kT                       = 28.15
-    kM                       = 0.018
-    T_m                      = 0.25
-    alpha                    = 1.0 - np.exp(-sim_dt / T_m).item()
-    disturbance_force_scale  = 4 * kT * 0.2
-    disturbance_moment_scale = 4 * kT * kM * 0.2
+    state = torch.cat(
+        [
+            pos_transformed,
+            yaw,
+            pitch,
+            roll,
+            lin_vel_transformed,
+            ang_vel_transformed,
+            tilt_angle,  
+        ],
+        dim=-1,
+    )
+    return state.cpu().detach().numpy()
 
-    disturb                  = True 
-    quantize_tilt_actions    = False
+def mpc_update(solver,N_horizon,mpc_state,x_ref,u_ref,update_cost=True):
+    # get current state
+    xcurrent = mpc_state[:-1]
+    phicurrent = mpc_state[-1]
     
+    # adapt cost function
+    if update_cost:
+        Q_, R_, Qt_ = get_cost_weights(xcurrent[2],phicurrent)
+        for j in range(N_horizon):
+            solver.cost_set(j, "W", scipy.linalg.block_diag(Q_, R_))
+        solver.cost_set(N_horizon, "W", Qt_)
+
+    # set initial state constraint
+    solver.set(0, "lbx", xcurrent)
+    solver.set(0, "ubx", xcurrent)
+    
+    # solve ocp
+    mpc_status = solver.solve()  
+    print(f"mpc_status: {mpc_status}")
+
+    # get first input
+    u_opt = solver.get(0, "u")   
+
+    # set the reference and parameters
+    for j in range(N_horizon):
+        yref = np.hstack((x_ref,u_ref))
+        solver.set(j, "yref", yref)
+        solver.set(j, "p", np.array([phicurrent]))
+
+    return u_opt
+
+def traj_descent_time(t):
+    tilt_vel = 1.0
+    descent_vel = 0.5
+    z0 = -2.0
+    z = np.clip(z0 + descent_vel*t, -2.0, 0.0)
+    dz = descent_vel
+    x_ref = np.zeros(12)
+    x_ref[2] = z
+    x_ref[8] = dz
+    u_ref = np.zeros(4)
+    return x_ref,u_ref,tilt_vel
+
+"""Main function."""
+def main():   
+    # get parameters
+    rl_path                     = params_.get('rl_path')
+    N_horizon                   = params_.get('N_horizon')
+    acados_ocp_path             = params_.get('acados_ocp_path')
+    build_mpc                   = params_.get('build_mpc')
+    v_max_absolute              = params_.get('v_max_absolute')
+    use_rl                      = params_.get('use_rl')
+    disturb                     = params_.get('disturb')
+    quantize_tilt_actions       = params_.get('quantize_tilt_actions')
+    sim_dt                      = params_.get('sim_dt')
+    decimation                  = params_.get('decimation')
+    action_update_rate          = params_.get('action_update_rate')
+    sim_time                    = params_.get('sim_time')
+    sim_steps                   = params_.get('sim_steps')
+    alpha                       = params_.get('alpha')
+    disturbance_force_scale     = params_.get('disturbance_force_scale')
+    disturbance_moment_scale    = params_.get('disturbance_moment_scale')
+    desired_position            = params_.get('desired_position')
+    initial_pose                = params_.get('initial_pose')
+    initial_twist               = params_.get('initial_twist')
+    kT                          = params_.get('kT')
+    kM                          = params_.get('kM')
+    thruster_effectiveness      = params_.get('thruster_effectiveness')
+
+    # get rl model from rl_path
+    rl = ort.InferenceSession(rl_path)
+
+    # get run_name
+    run_name = "rl" if use_rl else "mpc"
+    run_name = run_name
+
+    # define the MPC solver
+    ocp  = create_ocp_solver_description()
+    acados_ocp_solver = AcadosOcpSolver(
+        ocp, 
+        json_file=os.path.join(acados_ocp_path, ocp.model.name + '_acados_ocp.json'),
+        generate =build_mpc,
+        build    =build_mpc
+    )
+
+    # initialize the solver
+    for stage in range(N_horizon + 1):
+        acados_ocp_solver.set(stage, "x", np.zeros(12))
+        acados_ocp_solver.set(stage, "p", np.array([0.0]))
+    for stage in range(N_horizon):
+        acados_ocp_solver.set(stage, "u", np.zeros(4))
+
     # Load kit helper
     sim_cfg = sim_utils.SimulationCfg(dt=sim_dt, device=args_cli.device)
     sim = SimulationContext(sim_cfg)
@@ -241,8 +356,6 @@ def main():
     rotor3    = robot.find_bodies("rotor3")[0]
     base_link = robot.find_bodies("base_link")[0]
 
-
-    print("rotor0 ", rotor0)
     # Get joints
     joint0 = robot.find_joints("base_to_arml")[0]
     joint1 = robot.find_joints("base_to_armr")[0]
@@ -260,7 +373,7 @@ def main():
     filtered_actions = torch.zeros(robot.num_instances, 5, device=args_cli.device)
 
     # action history
-    action_history_length = 1
+    action_history_length = 10
     action_history = torch.zeros(robot.num_instances, action_history_length, 5, device=args_cli.device)
 
     # Define simulation stepping
@@ -276,6 +389,7 @@ def main():
     filtered_actions_log = []
     observations_log     = []
     times_log            = []
+    x_ref_log            = []
 
     # Simulate physics
     while simulation_app.is_running() and count < sim_steps:
@@ -284,52 +398,61 @@ def main():
             # reset counters
             sim_time = 0.0
             count = 0
+
             # reset dof state
             joint_pos, joint_vel = robot.data.default_joint_pos, robot.data.default_joint_vel
             robot.write_joint_state_to_sim(joint_pos, joint_vel)
             robot.write_root_link_pose_to_sim(initial_pose)
-            robot.write_root_com_velocity_to_sim(robot.data.default_root_state[:, 7:])
+            robot.write_root_com_velocity_to_sim(initial_twist)
             robot.reset()
+
             # reset command
             print(">>>>>>>> Reset!")
 
-        action_history     = torch.cat([actions.clone().unsqueeze(dim=1), action_history[:, 1:]], dim=1)
-        obs = get_observations(robot, pos_d, action_history).cpu().detach().numpy()
+        if count % action_update_rate == 0:
+            action_history     = torch.cat([actions.clone().unsqueeze(dim=1), action_history[:, :-1]], dim=1)
+        obs = get_observations(robot, desired_position, action_history).cpu().detach().numpy()
+        
         if count % decimation == 0:
-            # get action from rl 
-            outputs = rl.run(None, {"obs": obs.astype(np.float32)})
-            mu = outputs[0]
-            # sigma = np.exp(outputs[1])
-            actions = torch.tensor(mu, device=args_cli.device)   
-            print(actions)
+            if use_rl:
+                x_ref = np.zeros(12)
+                outputs = rl.run(None, {"obs": obs.astype(np.float32)})
+                mu = outputs[0]
+                actions = torch.tensor(mu, device=args_cli.device)
+            else:
+                x_ref,u_ref,tilt_vel = traj_descent_time(sim_time)
+                mpc_state = get_mpc_state(robot)
+                actions = mpc_update(acados_ocp_solver, N_horizon, mpc_state, x_ref, u_ref)
+                actions = np.hstack((actions, np.array([tilt_vel])))
+                actions = torch.tensor(actions, device=args_cli.device).unsqueeze(0)
 
         # log observations actions and times
         observations_log.append(obs)
         times_log.append(sim_time)
         actions_log.append(actions.cpu().detach().numpy())
+        x_ref_log.append(x_ref)
 
         # Apply low-pass filter
         filtered_actions[:, :4] = low_pass_filter(actions[:, :4], filtered_actions[:, :4], alpha)
         filtered_actions[:, 4]  = actions[:, 4]
 
+        # log the filtered actions
         filtered_actions_log.append(filtered_actions.cpu().detach().numpy())
 
-        # Assign the joint positions and velocities
-        if quantize_tilt_actions:
-            tilt_action = torch.round(filtered_actions[:, 4])
-        else:
-            tilt_action     = filtered_actions[:, 4]
-        print("tilt_action ", tilt_action)
+        # get the tilt action
+        if quantize_tilt_actions: tilt_action = torch.round(filtered_actions[:, 4])
+        else: tilt_action     = filtered_actions[:, 4]
 
-        joint_pos[:, 0] = joint_pos[:, 0] + max_tilt_vel * tilt_action * sim_dt
+        # Update the joint position
+        joint_pos[:, 0] = joint_pos[:, 0] + v_max_absolute * tilt_action * sim_dt
         joint_pos       = torch.clamp(joint_pos,0.0,torch.pi/2)
-        joint_vel[:, 0] = max_tilt_vel * tilt_action
+        joint_vel[:, 0] = v_max_absolute * tilt_action
 
         # Assign the thrust to each of the rotors
-        thrust[:, 0, 2] = kT * filtered_actions[:, 0]
-        thrust[:, 1, 2] = kT * filtered_actions[:, 1]
-        thrust[:, 2, 2] = kT * filtered_actions[:, 2]
-        thrust[:, 3, 2] = kT * filtered_actions[:, 3]
+        thrust[:, 0, 2] = thruster_effectiveness[0] * kT * filtered_actions[:, 0]
+        thrust[:, 1, 2] = thruster_effectiveness[1] * kT * filtered_actions[:, 1]
+        thrust[:, 2, 2] = thruster_effectiveness[2] * kT * filtered_actions[:, 2]
+        thrust[:, 3, 2] = thruster_effectiveness[3] * kT * filtered_actions[:, 3]
 
         # Assign the moments to each of the rotors
         moment[:, 0, 2] = -kM * thrust[:, 0, 2]
@@ -349,7 +472,6 @@ def main():
         robot.set_external_force_and_torque(thrust[:, 2, :], moment[:, 2, :], body_ids=rotor2)
         robot.set_external_force_and_torque(thrust[:, 3, :], moment[:, 3, :], body_ids=rotor3)
 
-
         # Apply the joint velocity to the joint
         robot.set_joint_velocity_target(joint_vel[:, 0], joint_ids=joint0)
         robot.set_joint_velocity_target(joint_vel[:, 0], joint_ids=joint1)
@@ -362,18 +484,14 @@ def main():
         robot.write_data_to_sim()
 
         # Get marker location and orientation
-        # get rotor0 location
         rotor0_pos = robot.data.body_pos_w[:, rotor0].squeeze(0)
-
-
         marker_locations = torch.stack([
                                         robot.data.root_link_pos_w, 
-                                        pos_d.unsqueeze(0),
+                                        desired_position.unsqueeze(0),
                                         rotor0_pos
                                         ], 
                                     dim=1
                                     ).squeeze()
-        
         marker_orientations = torch.stack([
                                             robot.data.root_link_quat_w, 
                                             torch.tensor([1.0, 0.0, 0.0, 0.0], device=args_cli.device).unsqueeze(0), 
@@ -389,24 +507,64 @@ def main():
 
         # update sim-time
         sim_time += sim_dt
-        count += 1
+        count    += 1
 
         # update buffers
         robot.update(sim_dt)
 
-    return times_log, observations_log, actions_log, filtered_actions_log
+    return times_log, observations_log, actions_log, filtered_actions_log, x_ref_log, run_name
 
 if __name__ == "__main__":
     # run the main function
-    times_log, observations_log, actions_log, filtered_actions_log = main()
+    times_log, observations_log, actions_log, filtered_actions_log, x_ref_log, run_name = main()
 
     # plot the data
-    plot_data(actions_log, filtered_actions_log, observations_log, times_log)
+    plot_data(actions_log, filtered_actions_log, observations_log, times_log, x_ref_log)
 
-    # save data
-    np.save("times_log.npy", times_log)
-    np.save("observations_log.npy", observations_log)
-    np.save("actions_log.npy", actions_log)
+    import os
+    import h5py
+    import yaml
+    import numpy as np
+    import torch
+    from datetime import datetime
+
+    # Generate a timestamped folder
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_folder = f"/home/m4pc/src/IsaacLab/source/standalone/demos/data/run_{run_name}_{timestamp}"
+    os.makedirs(run_folder, exist_ok=True)
+
+    # Save data in an HDF5 file inside the timestamped folder
+    h5_path = os.path.join(run_folder, f"data_{run_name}.h5")
+    with h5py.File(h5_path, 'w') as file:
+        file.create_dataset("times", data=times_log)
+        file.create_dataset("observations", data=observations_log)
+        file.create_dataset("actions", data=actions_log)
+        file.create_dataset("filtered_actions", data=filtered_actions_log)
+        file.create_dataset("x_ref", data=x_ref_log)
+
+    # Convert NumPy/PyTorch objects before saving YAML
+    def convert_tensors_and_arrays(obj):
+        """Recursively convert NumPy arrays, NumPy scalars, and PyTorch tensors to native types."""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, torch.Tensor):
+            return obj.tolist()
+        elif isinstance(obj, (np.floating, np.integer)):  # Handle NumPy scalars
+            return obj.item()
+        elif isinstance(obj, dict):
+            return {key: convert_tensors_and_arrays(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_tensors_and_arrays(item) for item in obj]
+        return obj
+
+    params_serialized = convert_tensors_and_arrays(params_)
+
+    # Save parameters in a YAML file inside the timestamped folder
+    yaml_path = os.path.join(run_folder, f"params_{run_name}.yaml")
+    with open(yaml_path, 'w') as file:
+        yaml.dump(params_serialized, file)
+
+    print(f"Data and parameters saved in {run_folder}")
 
     # close sim app
     simulation_app.close()
