@@ -1,32 +1,48 @@
 import numpy as np
 import torch
 from omni.isaac.lab.utils.math import quat_from_euler_xyz
+from IPython import embed
 
 # declare parameter dictionary
 params_ = {}
 
+# number of environments
+params_['num_envs']                = 1
+
 # rl model
-params_['rl_path']                  = "/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-02-13_01-37-53-best-delays/nn/exported/policy.onnx"
+params_['rl_path']                  = "/home/m4pc/src/IsaacLab/logs/rl_games/atmo/2025-02-13_01-37-53-best-delay-20ms/nn/exported/policy_dynamic.onnx"
 
 # high level parameters
-params_['use_rl']                   = False
+params_['control_algorithm']        = 'mpc-phi'   # choose between rl, mpc, mpc-phi, rl-brtc, mpc-brtc, brtc
 params_['build_mpc']                = False
 params_['disturb']                  = False 
+params_['disturbance_type']         = 'push'  # choose between push and white
 params_['quantize_tilt_actions']    = False
 
 # simulation parameters
 params_['device']                   = 'cuda:0'
+params_['vis_markers']              = False
+
 params_['sim_dt']                   = 1 / 100  
 params_['decimation']               = 1
 params_['action_update_rate']       = 2
+params_['observation_delay']        = 1
+
 params_['sim_time']                 = 6.0
 params_['sim_steps']                = int(params_['sim_time']/params_['sim_dt'])
-params_['kT']                       = 28.15                                                                 
-params_['kM']                       = 0.018                                
+
+params_['kT']                       = 28.15                                                       
+params_['kM']                       = 0.018        
+params_['spin_direction']           = torch.tensor([-1.0, -1.0, 1.0, 1.0],device=params_['device'])          
 params_['T_m']                      = 0.15
 params_['alpha']                    = 1.0 - np.exp(-params_['sim_dt'] / params_['T_m']).item()
-params_['disturbance_force_scale']  = 4 * params_['kT'] * 0.2
-params_['disturbance_moment_scale'] = 4 * params_['kT'] * params_['kM'] * 0.2
+
+params_['white_force_scale']        = 4 * params_['kT'] * 0.2
+params_['white_moment_scale']       = 4 * params_['kT'] * params_['kM'] * 0.2
+
+params_['push_time']                = 0.5
+params_['push_duration']            = 0.1
+
 params_['desired_position']         = torch.tensor([0.0, 0.0, 0.0],device=params_['device'])
 params_['initial_pose']             = torch.cat(
                                         [
@@ -36,12 +52,14 @@ params_['initial_pose']             = torch.cat(
                                          dim=-1,
                                     )
 params_['initial_twist']            = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0],device=params_['device']) 
-params_['thruster_effectiveness']   = [1.0, 1.0, 1.0, 1.0]
+params_['thruster_effectiveness']   = torch.tensor([0.8,0.9,0.85,1.1],device=params_['device']) 
+params_['mass_deviations']          = torch.tensor([1.0,1.0,1.0],device=params_['device'])
 
 # MPC parameters
-params_['N_horizon']             = 10
-params_['T_horizon']             = 1.2
+params_['N_horizon']             = 20
+params_['T_horizon']             = 2.0
 params_['acados_ocp_path']       = '/home/m4pc/src/IsaacLab/source/standalone/demos/acados_models/'
+params_['acados_ocp_path_phi']   = '/home/m4pc/src/IsaacLab/source/standalone/demos/acados_models_phi/'
 params_['u_max']                 = 1.0
 params_['v_max_absolute']        = (np.pi/2)/4
 
@@ -57,35 +75,35 @@ params_['z_star']                = params_.get('h_wheel_ground') + params_.get('
 params_['u_ramp_down_rate']      = 0.15  
 
 # dynamics parameters (use z-down parameters from excel sheet even though urdf uses z-up parameters)
-params_['g']                = 9.81                                                                   # gravitational acceleration
-params_['m_base']           = 2.33                                                                   # mass of base
-params_['m_arm']            = 1.537                                                                  # mass of arm
-params_['m_rotor']          = 0.021                                                                  # mass of rotor 
-params_['m']                = params_['m_base'] + 2*params_['m_arm'] + 4*params_['m_rotor']          # total mass 
-params_['I_base_xx']        = 0.0067
-params_['I_base_yy']        = 0.011
-params_['I_base_zz']        = 0.0088
-params_['I_base_xy']        = -0.000031
-params_['I_base_xz']        = 0.00046
-params_['I_base_yz']        = 0.00004
-params_['I_arm_xx']         = 0.008732
-params_['I_arm_yy']         = 0.036926
-params_['I_arm_zz']         = 0.043822
-params_['I_arm_xy']         = 0.000007
-params_['I_arm_xz']         = -0.000012
-params_['I_arm_yz']         = 0.000571
-params_['I_rotor_xx']       = 0.000022
-params_['I_rotor_yy']       = 0.000022
-params_['I_rotor_zz']       = 0.000043
-params_['r_BA_right_x']     = 0.0066
-params_['r_BA_right_y']     = 0.0685
-params_['r_BA_right_z']     = -0.021
-params_['r_AG_right_x']     = -0.00032
-params_['r_AG_right_y']     = 0.16739
-params_['r_AG_right_z']     = -0.02495
-params_['r_AR1_x']          = 0.16491
-params_['r_AR1_y']          = 0.13673
-params_['r_AR1_z']          = -0.069563
+params_['g']                     = 9.81                                                                   # gravitational acceleration
+params_['m_base']                = 2.33                                                                   # mass of base
+params_['m_arm']                 = 1.537                                                                  # mass of arm
+params_['m_rotor']               = 0.021                                                                  # mass of rotor 
+params_['m']                     = params_['m_base'] + 2*params_['m_arm'] + 4*params_['m_rotor']          # total mass 
+params_['I_base_xx']             = 0.0067
+params_['I_base_yy']             = 0.011
+params_['I_base_zz']             = 0.0088
+params_['I_base_xy']             = -0.000031
+params_['I_base_xz']             = 0.00046
+params_['I_base_yz']             = 0.00004
+params_['I_arm_xx']              = 0.008732
+params_['I_arm_yy']              = 0.036926
+params_['I_arm_zz']              = 0.043822
+params_['I_arm_xy']              = 0.000007
+params_['I_arm_xz']              = -0.000012
+params_['I_arm_yz']              = 0.000571
+params_['I_rotor_xx']            = 0.000022
+params_['I_rotor_yy']            = 0.000022
+params_['I_rotor_zz']            = 0.000043
+params_['r_BA_right_x']          = 0.0066
+params_['r_BA_right_y']          = 0.0685
+params_['r_BA_right_z']          = -0.021
+params_['r_AG_right_x']          = -0.00032
+params_['r_AG_right_y']          = 0.16739
+params_['r_AG_right_z']          = -0.02495
+params_['r_AR1_x']               = 0.16491
+params_['r_AR1_y']               = 0.13673
+params_['r_AR1_z']               = -0.069563
 
 # cost function parameters (velocity tracking) flight
 params_['w_x']        = 10.0  
@@ -93,7 +111,7 @@ params_['w_y']        = 10.0
 params_['w_z']        = 20.0    
 params_['w_dx']       = 1.0    
 params_['w_dy']       = 1.0    
-params_['w_dz']       = 3.0    
+params_['w_dz']       = 2.0    
 params_['w_phi']      = 0.1     
 params_['w_th']       = 0.1     
 params_['w_psi']      = 0.1     
@@ -103,6 +121,8 @@ params_['w_oz']       = 1.5
 params_['w_u']        = 1.0       
 params_['rho']        = 0.1     
 params_['gamma']      = 1.0     
+
+params_['w_phi']      = 10.0
 
 # cost function flight
 params_['Q_mat']          = np.diag([
@@ -121,6 +141,21 @@ params_['Q_mat']          = np.diag([
                                      ])
 params_['R_mat']          = params_['rho'] * np.diag([params_['w_u'],params_['w_u'],params_['w_u'],params_['w_u']])
 params_['Q_mat_terminal'] = params_['gamma'] * params_['Q_mat']
+
+# Extend Q_mat to include cost on phi
+params_['Q_mat_phi'] = np.block([
+    [params_['Q_mat'],                      np.zeros((params_['Q_mat'].shape[0], 1))],
+    [np.zeros((1, params_['Q_mat'].shape[1])), np.array([[params_['w_phi']]])]
+])
+
+# Extend R_mat to include cost on phi
+params_['R_mat_phi'] = np.block([
+    [params_['R_mat'],                      np.zeros((params_['R_mat'].shape[0], 1))],
+    [np.zeros((1, params_['R_mat'].shape[1])), np.array([[params_['w_phi']]])]
+])
+
+# Extend Q_mat_terminal to include cost on phi
+params_['Q_mat_terminal_phi'] = params_['gamma'] * params_['Q_mat_phi']
 
 # cost function parameters near ground
 params_['w_x_near_ground']        = 0.0   # exp: ?  TBD  

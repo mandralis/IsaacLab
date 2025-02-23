@@ -8,6 +8,7 @@ from __future__ import annotations
 import gymnasium as gym
 import torch
 from numpy import pi, exp, copy
+from IPython import embed
 
 import omni.isaac.lab.sim as sim_utils
 from omni.isaac.lab.assets import Articulation, ArticulationCfg
@@ -46,7 +47,6 @@ class ATMOEnvWindow(BaseEnvWindow):
                     # add command manager visualization
                     self._create_debug_vis_ui_element("targets", self.env)
 
-
 @configclass
 class ATMOEnvCfg(DirectRLEnvCfg):
     # high level flags 
@@ -66,13 +66,12 @@ class ATMOEnvCfg(DirectRLEnvCfg):
 
     # env
     episode_length_s                         = 5.0    
-    sim_dt                                   = 1/50  # training 1/100
+    sim_dt                                   = 1/50   # training 1/100
     decimation                               = 1      # training 2
     action_space                             = 5
 
     num_obs                                  = 19 + action_space * action_history_length
     observation_space                        = (observation_history_length + 1) * num_obs
-    # observation_space                        = num_obs
 
     num_privileged_obs                       = 12   
     state_space                              = 0
@@ -120,13 +119,13 @@ class ATMOEnvCfg(DirectRLEnvCfg):
     )
 
     # termination conditions
-    too_fast_vel                       = 2.0   
-    termination_dxy                    = 1.50
-    termination_height                 = 3.0
+    too_fast_vel                       = 2.0   # 2
+    termination_dxy                    = 1.50  # 1.5
+    termination_height                 = 3.0   # 3
 
     # observation delay (num steps)
     observation_buffer_length          = 5
-    observation_delay                  = 0
+    observation_delay                  = 1
 
     # acceptance state radius
     delta_d                            = 0.40
@@ -136,10 +135,9 @@ class ATMOEnvCfg(DirectRLEnvCfg):
     
     # reward scales
     lin_vel_pen_scale                  = -0.10
-    ang_vel_pen_scale                  = -0.30  # best so far 0.10
+    ang_vel_pen_scale                  = -0.30
     spin_pen_scale                     = -0.30  
-    action_rate_pen_scale              = -0.07   # best so far 0.30
-    # action_rate_tilt_pen_scale         = -0.01  # best so far 0.30
+    action_rate_pen_scale              = -0.80
     ground_thrust_pen_scale            = -0.13
     orientation_pen_scale              = -0.10
 
@@ -148,7 +146,7 @@ class ATMOEnvCfg(DirectRLEnvCfg):
 
     distance_to_goal_xy_rew_scale      = 0.30
     descending_rew_scale               = 0.30
-    tilt_rew_scale                     = 0.40
+    tilt_rew_scale                     = 0.80
     contact_in_acceptance_rew_scale    = 0.40
 
     # nominal parameters
@@ -157,8 +155,8 @@ class ATMOEnvCfg(DirectRLEnvCfg):
     max_tilt_vel_0 = pi / 8
 
     # random force and torque scales
-    disturbance_force_scale            = 4 * kT_0 * 0.05         # best 0.05         
-    disturbance_moment_scale           = 4 * kT_0 * kM_0 * 0.05  # best 0.05         
+    disturbance_force_scale            = 4 * kT_0 * 0.50        # best 0.05         
+    disturbance_moment_scale           = 4 * kT_0 * kM_0 * 0.05 # best 0.05         
 
     dist_force_cts_scale              = 4 * kT_0 * 0.0  
     dist_moment_cts_scale             = 4 * kT_0 * kM_0 * 0.0
@@ -220,18 +218,12 @@ class ATMOEnv(DirectRLEnv):
         self._action_history = torch.zeros(self.num_envs, self.cfg.action_history_length, gym.spaces.flatdim(self.single_action_space), device=self.device)
 
         # Thrust and moments applied to the rotor bodies
-        self._thrust0 = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._moment0 = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._thrust1 = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._moment1 = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._thrust2 = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._moment2 = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._thrust3 = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self._moment3 = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.thrust = torch.zeros(self.num_envs, 4, 3, device=self.device)
+        self.moment = torch.zeros(self.num_envs, 4, 3, device=self.device)
 
         # Joint velocities and positions
-        self._joint_vel = torch.zeros(self.num_envs, 1, 1, device=self.device)
-        self._joint_pos = torch.zeros(self.num_envs, 1, 1, device=self.device)
+        self._tilt_vel = torch.zeros(self.num_envs, 1, device=self.device)
+        self._tilt_angle = torch.zeros(self.num_envs, 1, device=self.device)
         
         # Goal position
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
@@ -267,7 +259,6 @@ class ATMOEnv(DirectRLEnv):
                 "lin_vel_pen",
                 "ang_vel_pen",
                 "action_rate_pen",
-                # "action_rate_tilt_pen",
                 "ground_thrust_penalty",
                 "spin_penalty",
                 "orientation_pen",
@@ -281,19 +272,19 @@ class ATMOEnv(DirectRLEnv):
         }
 
         # Get specific body indices
-        self._base_link = self._robot.find_bodies("base_link")[0]
-        self._rotor0    = self._robot.find_bodies("rotor0")[0]
-        self._rotor1    = self._robot.find_bodies("rotor1")[0]
-        self._rotor2    = self._robot.find_bodies("rotor2")[0]
-        self._rotor3    = self._robot.find_bodies("rotor3")[0]
+        self._base_link = self._robot.find_bodies("base_link")[0][0]
+        self._rotor0    = self._robot.find_bodies("rotor0")[0][0]
+        self._rotor1    = self._robot.find_bodies("rotor1")[0][0]
+        self._rotor2    = self._robot.find_bodies("rotor2")[0][0]
+        self._rotor3    = self._robot.find_bodies("rotor3")[0][0]
 
         # Get the joint indices
-        self._joint0 = self._robot.find_joints("base_to_arml")[0]
-        self._joint1 = self._robot.find_joints("base_to_armr")[0]
+        self._joint0 = self._robot.find_joints("base_to_arml")[0][0]
+        self._joint1 = self._robot.find_joints("base_to_armr")[0][0]
 
         # Get arml and armr indices
-        self._arml = self._robot.find_bodies("arml")[0]
-        self._armr = self._robot.find_bodies("armr")[0]
+        self._arml = self._robot.find_bodies("arml")[0][0]
+        self._armr = self._robot.find_bodies("armr")[0][0]
 
         # Get inertial parameters
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
@@ -345,71 +336,51 @@ class ATMOEnv(DirectRLEnv):
             self._actions_filtered[:, 4] = torch.round(self._actions_filtered[:, 4])
 
         # Assign the thrust to each of the rotors
-        self._thrust0[:, 0, 2] = self.kT[:,0] * self._actions_filtered[:, 0]
-        self._thrust1[:, 0, 2] = self.kT[:,0] * self._actions_filtered[:, 1]
-        self._thrust2[:, 0, 2] = self.kT[:,0] * self._actions_filtered[:, 2]
-        self._thrust3[:, 0, 2] = self.kT[:,0] * self._actions_filtered[:, 3]
-
-        # Assign the moments to each of the rotors
-        self._moment0[:, 0, 2] = -self.kM[:,0]  * self._thrust0[:, 0, 2]
-        self._moment1[:, 0, 2] = -self.kM[:,0]  * self._thrust1[:, 0, 2]
-        self._moment2[:, 0, 2] =  self.kM[:,0]  * self._thrust2[:, 0, 2]
-        self._moment3[:, 0, 2] =  self.kM[:,0]  * self._thrust3[:, 0, 2]
+        spin_direction = torch.tensor([-1.0, -1.0, 1.0, 1.0], device=self.device)    
+        self.thrust[:,:,2] = (self.kT.reshape(self.num_envs, 1, 1) * self._actions_filtered.reshape(self.num_envs, 1, 5)[:, :, :4]).squeeze()
+        self.moment[:,:,2] = spin_direction * self.kM * self.thrust[:, :, 2]
 
         # Assign the joint positions and velocities
-        tilt_action              = self._actions_filtered[:, 4]
-        self._joint_pos[:, 0, 0] = self._joint_pos[:, 0, 0] + self.max_tilt_vel[:,0] * tilt_action * self.physics_dt
-        self._joint_pos          = torch.clamp(self._joint_pos,0.0,torch.pi/2)
-
-        self._joint_vel[:, 0, 0] = self.max_tilt_vel[:,0] * tilt_action
+        tilt_action        = self._actions_filtered[:, 4].unsqueeze(1)
+        self._tilt_angle   = self._tilt_angle + self.max_tilt_vel * tilt_action * self.physics_dt
+        self._tilt_angle   = torch.clamp(self._tilt_angle,0.0,torch.pi/2)
+        self._tilt_vel     = self.max_tilt_vel * tilt_action
 
     def _apply_action(self):
-        
-        # Determine whether to push robot
-        push = torch.logical_and(self._time_elapsed >= self._push_time, self._time_elapsed <= self._push_time + self._push_duration)
-        
-        # Compute disturbance force
-        disturbance_force = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        disturbance_force[:,0,0] = self._disturbance_force[:,0,0] * push
-        disturbance_force[:,0,1] = self._disturbance_force[:,0,1] * push
-        disturbance_force[:,0,2] = self._disturbance_force[:,0,2] * push
 
-        # Compute disturbance moment
-        disturbance_moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        disturbance_moment[:,0,0] = self._disturbance_moment[:,0,0] * push
-        disturbance_moment[:,0,1] = self._disturbance_moment[:,0,1] * push
-        disturbance_moment[:,0,2] = self._disturbance_moment[:,0,2] * push
-
-        # Apply another disturbance force and moment of different nature
-        dist_force_cts        = torch.zeros(self.num_envs, 1, 3, device=self.device).uniform_(-self.cfg.dist_force_cts_scale, self.cfg.dist_force_cts_scale)
-        dist_moment_cts       = torch.zeros(self.num_envs, 1, 3, device=self.device).uniform_(-self.cfg.dist_moment_cts_scale, self.cfg.dist_moment_cts_scale)
-
-        # Apply the disturbance force and moment to the base link
+        dist_force      = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        dist_moment     = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        dist_force_cts  = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        dist_moment_cts = torch.zeros(self.num_envs, 1, 3, device=self.device)
         if self.cfg.disturb:
-            self._robot.set_external_force_and_torque(disturbance_force + dist_force_cts, disturbance_moment + dist_moment_cts, body_ids=self._base_link)
+            # Determine whether to push robot
+            push = torch.logical_and(self._time_elapsed >= self._push_time, self._time_elapsed <= self._push_time + self._push_duration).reshape(self.num_envs, 1, 1)
+            
+            # Compute disturbance force
+            dist_force = self._disturbance_force * push
+            dist_moment = self._disturbance_moment * push
 
-        # Apply the thrust and moments to the rotor bodies
-        self._robot.set_external_force_and_torque(self._thrust0, self._moment0, body_ids=self._rotor0)
-        self._robot.set_external_force_and_torque(self._thrust1, self._moment1, body_ids=self._rotor1)
-        self._robot.set_external_force_and_torque(self._thrust2, self._moment2, body_ids=self._rotor2)
-        self._robot.set_external_force_and_torque(self._thrust3, self._moment3, body_ids=self._rotor3)
+            # Apply another disturbance force and moment of different nature
+            dist_force_cts        = torch.zeros(self.num_envs, 1, 3, device=self.device).uniform_(-self.cfg.dist_force_cts_scale, self.cfg.dist_force_cts_scale)
+            dist_moment_cts       = torch.zeros(self.num_envs, 1, 3, device=self.device).uniform_(-self.cfg.dist_moment_cts_scale, self.cfg.dist_moment_cts_scale)
 
-        # Apply the joint velocity to the joint
-        self._robot.set_joint_velocity_target(self._joint_vel[:, 0], joint_ids=self._joint0)
-        self._robot.set_joint_velocity_target(self._joint_vel[:, 0], joint_ids=self._joint1)
+        # Get total force and moment
+        total_force  = torch.cat([self.thrust, dist_force + dist_force_cts], dim=1)
+        total_moment = torch.cat([self.moment, dist_moment + dist_moment_cts], dim=1)
 
-        # Apply the joint position to the joint
-        self._robot.set_joint_position_target(self._joint_pos[:, 0], joint_ids=self._joint0)
-        self._robot.set_joint_position_target(self._joint_pos[:, 0], joint_ids=self._joint1)
+        # Apply forces, moments and joint targets
+        self._robot.set_external_force_and_torque(total_force, total_moment, body_ids=[self._rotor0,self._rotor1,self._rotor2,self._rotor3,self._base_link])
+        self._robot.set_joint_velocity_target(self._tilt_vel.repeat(1,2), joint_ids=[self._joint0,self._joint1])
+        self._robot.set_joint_position_target(self._tilt_angle.repeat(1,2), joint_ids=[self._joint0,self._joint1])
 
     def _get_observations(self) -> dict:
         self._action_history     = torch.cat([self._actions.clone().unsqueeze(dim=1), self._action_history[:, :-1]], dim=1)
         relative_pos_w           = self._desired_pos_w - self._robot.data.root_link_pos_w
-        tilt_angle               = self._robot.data.joint_pos[:, self._joint0[0]].unsqueeze(dim=1)
+        tilt_angle               = self._robot.data.joint_pos[:, self._joint0].unsqueeze(dim=1)
         impulse                  = self.step_dt * torch.sum(torch.linalg.norm((self._contact_sensor.data.net_forces_w_history[:,1,:,:] - self._contact_sensor.data.net_forces_w_history[:,0,:,:]) * self.step_dt, dim=-1),dim=1).unsqueeze(dim=1) # type: ignore
         self._current_impulse    = impulse 
-        rot         = matrix_from_quat(self._robot.data.root_link_quat_w)
-        rot_vector = rot.reshape(-1, 9)
+        rot                      = matrix_from_quat(self._robot.data.root_link_quat_w)
+        rot_vector               = rot.reshape(-1, 9)
 
         noise = torch.cat(
             [
@@ -463,7 +434,7 @@ class ATMOEnv(DirectRLEnv):
         died, _ = self._get_dones()
 
         # contacts
-        current_contact_time                 = self.scene["contact_sensor"].data.current_contact_time[:, [self._arml[0], self._armr[0]]]
+        current_contact_time                 = self.scene["contact_sensor"].data.current_contact_time[:, [self._arml, self._armr]]
         num_contact                          = torch.sum(current_contact_time > 0.0, dim=1)
         self._current_contacts               = num_contact > 0
         new_contacts                         = torch.logical_and(torch.logical_xor(self._current_contacts , self._first_contact),self._current_contacts )
@@ -491,7 +462,7 @@ class ATMOEnv(DirectRLEnv):
         descending_error_mapped = torch.exp(-descending_error / 0.25)
 
         # tilt error
-        tilt              = self._robot.data.joint_pos[:, self._joint0[0]]
+        tilt              = self._robot.data.joint_pos[:, self._joint0]
         tilt_error        = torch.square(tilt - pi/2)
         tilt_error_mapped = torch.exp(-tilt_error / 0.25)
 
@@ -516,7 +487,6 @@ class ATMOEnv(DirectRLEnv):
             "lin_vel_pen":                    lin_vel                                            * self.cfg.lin_vel_pen_scale                  * self.step_dt, # policy obs: lin_vel (yes)
             "ang_vel_pen":                    ang_vel                                            * self.cfg.ang_vel_pen_scale                  * self.step_dt, # policy obs: ang_vel (yes)
             "action_rate_pen":                action_rate                                        * self.cfg.action_rate_pen_scale              * self.step_dt, # policy obs: previous action (yes)
-            # "action_rate_tilt_pen":           action_rate_tilt                                   * self.cfg.action_rate_tilt_pen_scale         * self.step_dt, # policy obs: previous action (yes)
             "ground_thrust_penalty":          ground_thrust                                      * self.cfg.ground_thrust_pen_scale            * self.step_dt, # critic obs: current_contacts (yes)
             "spin_penalty":                   spin_vel                                           * self.cfg.spin_pen_scale                     * self.step_dt, # critic obs: omegaz
             "orientation_pen":                flat_orientation                                   * self.cfg.orientation_pen_scale              * self.step_dt, # policy obs: root_link_quat_w (yes)
@@ -526,7 +496,7 @@ class ATMOEnv(DirectRLEnv):
              
             "distance_to_goal_xy_rew":        distance_to_goal_xy_mapped                         * self.cfg.distance_to_goal_xy_rew_scale      * self.step_dt, # policy obs: relative_pos (yes)
             "descending_rew":                 descending_error_mapped                            * self.cfg.descending_rew_scale               * self.step_dt, # no observation
-            "tilt_rew":                       tilt_error_mapped                                  * self.cfg.tilt_rew_scale                     * self.step_dt, # policy obs: tilt_angle (yes)
+            "tilt_rew":                       tilt_error_mapped * height_mapped                  * self.cfg.tilt_rew_scale                     * self.step_dt, # policy obs: tilt_angle (yes)
             "contact_in_acceptance_rew":      self._current_contacts  * self._in_acceptance_xy   * self.cfg.contact_in_acceptance_rew_scale    * self.step_dt, # critic obs: in_acceptance_ball (yes)
 
         }
@@ -606,18 +576,18 @@ class ATMOEnv(DirectRLEnv):
 
             # Randomize the initial tilt angle 
             joint_pos = self._robot.data.default_joint_pos[env_ids]
-            random_tilt = torch.zeros_like(joint_pos[:, self._joint0[0]]).uniform_(self.cfg.initial_tilt_range[0], self.cfg.initial_tilt_range[1])
-            joint_pos[:, self._joint0[0]] = random_tilt.clone()
-            joint_pos[:, self._joint1[0]] = random_tilt.clone()
+            random_tilt = torch.zeros_like(joint_pos[:, self._joint0]).uniform_(self.cfg.initial_tilt_range[0], self.cfg.initial_tilt_range[1])
+            joint_pos[:, self._joint0] = random_tilt.clone()
+            joint_pos[:, self._joint1] = random_tilt.clone()
 
             # Also set the initial tilt angle
-            self._joint_pos[env_ids,:,:] = joint_pos[:, self._joint0[0]].clone().unsqueeze(dim=1).unsqueeze(dim=1)
+            self._tilt_angle[env_ids,0] = random_tilt.clone()
             
             # Joint velocities randomly initialized
             joint_vel = self._robot.data.default_joint_vel[env_ids]
-            random_vel = torch.zeros_like(joint_vel[:, self._joint0[0]]).uniform_(self.cfg.initial_tilt_vel_range[0], self.cfg.initial_tilt_vel_range[1])
-            joint_vel[:, self._joint0[0]] = random_vel.clone()
-            joint_vel[:, self._joint1[0]] = random_vel.clone()
+            random_vel = torch.zeros_like(joint_vel[:, self._joint0]).uniform_(self.cfg.initial_tilt_vel_range[0], self.cfg.initial_tilt_vel_range[1])
+            joint_vel[:, self._joint0] = random_vel.clone()
+            joint_vel[:, self._joint1] = random_vel.clone()
 
             # Write the root state to the simulation
             self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -640,8 +610,8 @@ class ATMOEnv(DirectRLEnv):
             disturbance_moment_direction  = disturbance_moment_direction / (torch.linalg.norm(disturbance_moment_direction, dim=1).unsqueeze(dim=1) + 1e-6)
 
             # Randomize the push time and push duration
-            self._push_time[env_ids]     = self.cfg.episode_length_s * torch.zeros_like(self._push_time[env_ids]).uniform_(0.0, 0.8)
-            self._push_duration[env_ids] = torch.zeros_like(self._push_duration[env_ids]).uniform_(0.0, 1.0)
+            self._push_time[env_ids]     = self.cfg.episode_length_s * torch.zeros_like(self._push_time[env_ids]).uniform_(0.0, 0.5)  # best 0.8
+            self._push_duration[env_ids] = torch.zeros_like(self._push_duration[env_ids]).uniform_(0.0, 0.2) # best 1.0
 
             # Randomize disturbance intensity 
             force_intensity = torch.normal(torch.tensor(0.0), self.cfg.disturbance_force_scale)
@@ -679,7 +649,7 @@ class ATMOEnv(DirectRLEnv):
             default_root_state[:, :3] += self._terrain.env_origins[env_ids]
 
             joint_pos = self._robot.data.default_joint_pos[env_ids]
-            self._joint_pos[env_ids,:,:] = joint_pos[:, self._joint0[0]].clone().unsqueeze(dim=1).unsqueeze(dim=1)
+            self._tilt_angle[env_ids,0] = 0.0
 
             joint_vel = self._robot.data.default_joint_vel[env_ids]
 
@@ -688,7 +658,8 @@ class ATMOEnv(DirectRLEnv):
             self._robot.write_root_link_pose_to_sim(default_root_state[:, :7], env_ids)
 
             # Choose disturbance directions to test robot
-            disturbance_force_direction  = torch.normal(0.0, 1.0, size=(1,1,3),device=self.device).repeat(self.num_envs,1,1)
+            # disturbance_force_direction  = torch.normal(0.0, 1.0, size=(1,1,3),device=self.device).repeat(self.num_envs,1,1)
+            disturbance_force_direction  = torch.tensor([1.0,0.0,0.0],device=self.device).repeat(self.num_envs, 1, 1)
             disturbance_force_direction  = disturbance_force_direction / (torch.linalg.norm(disturbance_force_direction, dim=1).unsqueeze(dim=1) + 1e-6)
             
             disturbance_moment_direction  = torch.normal(0.0, 1.0, size=(1,1,3),device=self.device).repeat(self.num_envs,1,1)      
@@ -696,10 +667,11 @@ class ATMOEnv(DirectRLEnv):
 
             # Randomize the push time and push duration
             self._push_time[env_ids]     = 0.5 * torch.ones_like(self._push_time[env_ids])
-            self._push_duration[env_ids] = 1.0 * torch.ones_like(self._push_duration[env_ids])
+            self._push_duration[env_ids] = 0.5 * torch.ones_like(self._push_duration[env_ids])
 
             # Randomize disturbance intensity 
-            force_intensity = torch.normal(torch.tensor(0.0), self.cfg.disturbance_force_scale)
+            # force_intensity = torch.normal(torch.tensor(0.0), self.cfg.disturbance_force_scale)
+            force_intensity = 4 * self.cfg.kT_0 * 0.15 
             moment_intensity = torch.normal(torch.tensor(0.0), self.cfg.disturbance_moment_scale)
             self._disturbance_force  = force_intensity * disturbance_force_direction
             self._disturbance_moment = moment_intensity * disturbance_moment_direction

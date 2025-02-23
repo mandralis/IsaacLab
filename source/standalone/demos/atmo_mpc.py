@@ -16,15 +16,22 @@ T_horizon                   = params_.get('T_horizon')
 Q_mat                       = params_.get('Q_mat')
 R_mat                       = params_.get('R_mat')
 Q_mat_terminal              = params_.get('Q_mat_terminal')
+Q_mat_phi                   = params_.get('Q_mat_phi')
+R_mat_phi                   = params_.get('R_mat_phi')
+Q_mat_terminal_phi          = params_.get('Q_mat_terminal_phi')
 
 # temporary references (these get overwritten the first time mpc is called)
 x_ref                       = np.zeros(12,dtype='float')
 u_ref                       = np.zeros(4,dtype='float')
 x0                          = np.zeros(12,dtype='float')
 varphi0                     = 0.0
+x_ref_phi                   = np.zeros(13,dtype='float')
+u_ref_phi                   = np.zeros(5,dtype='float')
+x0_phi                      = np.zeros(13,dtype='float')
 
 # export directory
 acados_ocp_path             = params_.get('acados_ocp_path')
+acados_ocp_path_phi         = params_.get('acados_ocp_path_phi')
 
 # get robot model parameters 
 gravity              = params_.get('g')                                 
@@ -242,7 +249,26 @@ def dynamics_func():
     # finally write explicit dynamics
     f_expl = vertcat(u[0],u[1],u[2],chid,du)
     
-    return Function('dynamics_func',[X,U,varphi],[f_expl])
+    return Function('dynamics_func',[X,U,varphi],[f_expl])    
+
+def dynamics_phi_func():
+    # get symbolic variables
+    X_no_varphi      = MX.sym('X',12,1)
+    U_no_v           = MX.sym('U',4,1)
+    varphi           = MX.sym('varphi',1,1)
+
+    # get dynamics without phi dynamics
+    f_expl = dynamics_func()(X_no_varphi,U_no_v,varphi)
+ 
+    # finally write explicit dynamics including phi
+    v = MX.sym('v',1,1)
+    f_expl = vertcat(f_expl,v_max_absolute*v)
+
+    # get augmented state and input variables
+    X = vertcat(X_no_varphi,varphi)
+    U = vertcat(U_no_v,v)
+
+    return Function('dynamics_phi_func',[X,U],[f_expl])
 
 def export_robot_model() -> AcadosModel:
     model_name = "atmo"
@@ -285,6 +311,47 @@ def export_robot_model() -> AcadosModel:
     model.xdot = Xdot
     model.u = U
     model.p = p
+    model.name = model_name
+
+    return model
+
+def export_robot_model_phi() -> AcadosModel:
+    model_name = "atmo"
+
+    # states and controls
+    X = MX.sym("X",13)
+    U = MX.sym("U",5)
+
+    # Explicit dynamics
+    f_expl = dynamics_phi_func()(X,U)
+
+    # xdot
+    x_B_dot = MX.sym("x_B_dot")
+    y_B_dot = MX.sym("y_B_dot")
+    z_B_dot = MX.sym("z_B_dot")
+    theta_Bz_dot = MX.sym("theta_Bz_dot")
+    theta_By_dot = MX.sym("theta_By_dot")
+    theta_Bx_dot = MX.sym("theta_Bx_dot")
+    dx_B_dot = MX.sym("dx_B_dot")
+    dy_B_dot = MX.sym("dy_B_dot")
+    dz_B_dot = MX.sym("dz_B_dot")
+    omega_Bx_dot = MX.sym("omega_Bx_dot")
+    omega_By_dot = MX.sym("omega_By_dot")
+    omega_Bz_dot = MX.sym("omega_Bz_dot")
+    varphi_dot = MX.sym("varphi_dot")
+
+    Xdot = vertcat(x_B_dot,y_B_dot,z_B_dot,theta_Bz_dot,theta_By_dot,theta_Bx_dot,dx_B_dot,dy_B_dot,dz_B_dot,omega_Bx_dot,omega_By_dot,omega_Bz_dot,varphi_dot)
+
+    # write implicit dynamics 
+    f_impl = Xdot - f_expl
+
+    model = AcadosModel()
+
+    model.f_impl_expr = f_impl
+    model.f_expl_expr = f_expl
+    model.x = X
+    model.xdot = Xdot
+    model.u = U
     model.name = model_name
 
     return model
@@ -346,5 +413,65 @@ def create_ocp_solver_description() -> AcadosOcp:
 
     # export directory
     ocp.code_export_directory = acados_ocp_path
+
+    return ocp
+
+def create_ocp_solver_description_phi() -> AcadosOcp:
+    # create ocp object to formulate the OCP
+    ocp = AcadosOcp()
+
+    model = export_robot_model_phi()
+
+    ocp.model = model
+    nx = model.x.size()[0]
+    nu = model.u.size()[0]
+    ny = nx + nu
+
+    # set dimensions
+    ocp.dims.N = N_horizon
+
+    ocp.cost.cost_type = "LINEAR_LS"
+    ocp.cost.cost_type_e = "LINEAR_LS"
+
+    ny = nx + nu
+    ny_e = nx
+
+    ocp.cost.W_e = Q_mat_terminal_phi
+    ocp.cost.W = scipy.linalg.block_diag(Q_mat_phi, R_mat_phi)
+
+    ocp.cost.Vx = np.zeros((ny, nx))
+    ocp.cost.Vx[:nx, :nx] = np.eye(nx)
+
+    Vu = np.zeros((ny, nu))
+    Vu[nx : nx + nu, 0:nu] = np.eye(nu)
+    ocp.cost.Vu = Vu
+
+    ocp.cost.Vx_e = np.eye(nx)
+
+    ocp.cost.yref = np.hstack((x_ref_phi,u_ref_phi))
+    ocp.cost.yref_e = x_ref_phi
+
+    # set constraints
+    ocp.constraints.lbu = np.array([0,0,0,0,0])
+    ocp.constraints.ubu = np.array([+u_max,+u_max,+u_max,+u_max,+u_max])
+    ocp.constraints.idxbu = np.array([0,1,2,3,4])
+
+    ocp.constraints.lbx   = np.array([0])
+    ocp.constraints.ubx   = np.array([np.pi/2])
+    ocp.constraints.idxbx = np.array([13])
+    
+    ocp.constraints.x0 = x0_phi
+    
+    # set options
+    ocp.solver_options.qp_solver       = "FULL_CONDENSING_HPIPM"       # FULL_CONDENSING_QPOASES
+    ocp.solver_options.hessian_approx  = "GAUSS_NEWTON"                # GAUSS_NEWTON, EXACT
+    ocp.solver_options.integrator_type = "ERK"                         # ERK      
+    ocp.solver_options.nlp_solver_type = "SQP_RTI"                     # SQP_RTI, SQP
+
+    # set prediction horizon
+    ocp.solver_options.tf = T_horizon
+
+    # export directory
+    ocp.code_export_directory = acados_ocp_path_phi
 
     return ocp
